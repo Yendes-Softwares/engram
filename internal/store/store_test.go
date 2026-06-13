@@ -263,6 +263,124 @@ func TestUpdateAndSoftDeleteExcludedFromSearchAndTimeline(t *testing.T) {
 	}
 }
 
+func TestPinnedObservationsAndFormatContextPriority(t *testing.T) {
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	cfg.DedupeWindow = time.Hour
+	cfg.MaxContextResults = 2
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.CreateSession("s1", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	titles := []string{"pinned architecture", "recent one", "recent two", "recent three"}
+	ids := make([]int64, 0, len(titles))
+	for i, title := range titles {
+		id, err := s.AddObservation(AddObservationParams{
+			SessionID: "s1",
+			Type:      "decision",
+			Title:     title,
+			Content:   fmt.Sprintf("content %d", i),
+			Project:   "engram",
+			Scope:     "project",
+		})
+		if err != nil {
+			t.Fatalf("add observation %q: %v", title, err)
+		}
+		ids = append(ids, id)
+		createdAt := fmt.Sprintf("2026-01-0%d 00:00:00", i+1)
+		if _, err := s.db.Exec(`UPDATE observations SET created_at = ?, updated_at = ? WHERE id = ?`, createdAt, createdAt, id); err != nil {
+			t.Fatalf("set created_at for %q: %v", title, err)
+		}
+	}
+	exportedBeforePin, err := s.ExportProject("engram")
+	if err != nil {
+		t.Fatalf("export project before pin: %v", err)
+	}
+	exportedBeforePinJSON, err := json.Marshal(exportedBeforePin)
+	if err != nil {
+		t.Fatalf("marshal export before pin: %v", err)
+	}
+	var updatedAtBeforePin string
+	if err := s.db.QueryRow(`SELECT updated_at FROM observations WHERE id = ?`, ids[0]).Scan(&updatedAtBeforePin); err != nil {
+		t.Fatalf("get updated_at before pin: %v", err)
+	}
+
+	if err := s.PinObservation(ids[0]); err != nil {
+		t.Fatalf("pin observation: %v", err)
+	}
+	var updatedAtAfterPin string
+	if err := s.db.QueryRow(`SELECT updated_at FROM observations WHERE id = ?`, ids[0]).Scan(&updatedAtAfterPin); err != nil {
+		t.Fatalf("get updated_at after pin: %v", err)
+	}
+	if updatedAtAfterPin != updatedAtBeforePin {
+		t.Fatalf("pin should not change updated_at: before=%q after=%q", updatedAtBeforePin, updatedAtAfterPin)
+	}
+	pinned, err := s.PinnedObservations("engram", "project")
+	if err != nil {
+		t.Fatalf("pinned observations: %v", err)
+	}
+	if len(pinned) != 1 || pinned[0].ID != ids[0] || !pinned[0].Pinned {
+		t.Fatalf("expected pinned observation %d, got %#v", ids[0], pinned)
+	}
+
+	ctx, err := s.FormatContext("engram", "project")
+	if err != nil {
+		t.Fatalf("format context: %v", err)
+	}
+	pinnedIdx := strings.Index(ctx, "### Pinned")
+	recentIdx := strings.Index(ctx, "### Recent Observations")
+	if pinnedIdx < 0 || recentIdx < 0 || pinnedIdx > recentIdx {
+		t.Fatalf("expected pinned section before recent observations, got:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "pinned architecture") {
+		t.Fatalf("expected pinned observation in context, got:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "recent three") || !strings.Contains(ctx, "recent two") {
+		t.Fatalf("expected max recent unpinned observations in context, got:\n%s", ctx)
+	}
+	if strings.Contains(ctx, "recent one") {
+		t.Fatalf("expected recent window to stay at MaxContextResults, got:\n%s", ctx)
+	}
+	exported, err := s.ExportProject("engram")
+	if err != nil {
+		t.Fatalf("export project: %v", err)
+	}
+	exportedJSON, err := json.Marshal(exported)
+	if err != nil {
+		t.Fatalf("marshal export: %v", err)
+	}
+	if strings.Contains(string(exportedJSON), `"pinned"`) {
+		t.Fatalf("pinned state must stay out of sync/export JSON, got %s", exportedJSON)
+	}
+	if string(exportedJSON) != string(exportedBeforePinJSON) {
+		t.Fatalf("pinning must not change export payload:\nbefore: %s\nafter:  %s", exportedBeforePinJSON, exportedJSON)
+	}
+
+	if err := s.UnpinObservation(ids[0]); err != nil {
+		t.Fatalf("unpin observation: %v", err)
+	}
+	var updatedAtAfterUnpin string
+	if err := s.db.QueryRow(`SELECT updated_at FROM observations WHERE id = ?`, ids[0]).Scan(&updatedAtAfterUnpin); err != nil {
+		t.Fatalf("get updated_at after unpin: %v", err)
+	}
+	if updatedAtAfterUnpin != updatedAtBeforePin {
+		t.Fatalf("unpin should not change updated_at: before=%q after=%q", updatedAtBeforePin, updatedAtAfterUnpin)
+	}
+	pinned, err = s.PinnedObservations("engram", "project")
+	if err != nil {
+		t.Fatalf("pinned observations after unpin: %v", err)
+	}
+	if len(pinned) != 0 {
+		t.Fatalf("expected no pinned observations after unpin, got %#v", pinned)
+	}
+}
+
 func TestTopicKeyUpsertUpdatesSameTopicWithoutCreatingNewRow(t *testing.T) {
 	s := newTestStore(t)
 

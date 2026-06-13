@@ -100,6 +100,7 @@ type Observation struct {
 	DuplicateCount int     `json:"duplicate_count"`
 	LastSeenAt     *string `json:"last_seen_at,omitempty"`
 	ReviewAfter    *string `json:"review_after,omitempty"`
+	Pinned         bool    `json:"-"`
 	CreatedAt      string  `json:"created_at"`
 	UpdatedAt      string  `json:"updated_at"`
 	DeletedAt      *string `json:"deleted_at,omitempty"`
@@ -252,7 +253,7 @@ var decayReviewAfterMonths = map[string]int{
 }
 
 const observationSelectColumns = `id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-	       scope, topic_key, revision_count, duplicate_count, last_seen_at, review_after, created_at, updated_at, deleted_at`
+	       scope, topic_key, revision_count, duplicate_count, last_seen_at, review_after, pinned, created_at, updated_at, deleted_at`
 
 type SyncState struct {
 	TargetKey           string  `json:"target_key"`
@@ -714,6 +715,7 @@ func (s *Store) migrate() error {
 			revision_count INTEGER NOT NULL DEFAULT 1,
 			duplicate_count INTEGER NOT NULL DEFAULT 1,
 			last_seen_at TEXT,
+			pinned     BOOLEAN NOT NULL DEFAULT 0,
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
@@ -825,6 +827,7 @@ func (s *Store) migrate() error {
 		{name: "revision_count", definition: "INTEGER NOT NULL DEFAULT 1"},
 		{name: "duplicate_count", definition: "INTEGER NOT NULL DEFAULT 1"},
 		{name: "last_seen_at", definition: "TEXT"},
+		{name: "pinned", definition: "BOOLEAN NOT NULL DEFAULT 0"},
 		{name: "updated_at", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "deleted_at", definition: "TEXT"},
 	}
@@ -2205,8 +2208,7 @@ func (s *Store) AllObservations(project, scope string, limit int) ([]Observation
 	}
 
 	query := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.created_at, o.updated_at, o.deleted_at
+		SELECT ` + observationSelectColumns + `
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 	`
@@ -2396,8 +2398,7 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 	}
 
 	query := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.created_at, o.updated_at, o.deleted_at
+		SELECT ` + observationSelectColumns + `
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 	`
@@ -2418,6 +2419,81 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 	return s.queryObservations(query, args...)
 }
 
+func (s *Store) PinnedObservations(project, scope string) ([]Observation, error) {
+	project, _ = NormalizeProject(project)
+
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL AND o.pinned = 1
+	`
+	args := []any{}
+
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	if scope != "" {
+		query += " AND o.scope = ?"
+		args = append(args, normalizeScope(scope))
+	}
+
+	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC"
+	return s.queryObservations(query, args...)
+}
+
+func (s *Store) PinObservation(id int64) error {
+	return s.setObservationPinned(id, true)
+}
+
+func (s *Store) UnpinObservation(id int64) error {
+	return s.setObservationPinned(id, false)
+}
+
+func (s *Store) setObservationPinned(id int64, pinned bool) error {
+	value := 0
+	if pinned {
+		value = 1
+	}
+	res, err := s.execHook(s.db, `UPDATE observations SET pinned = ? WHERE id = ? AND deleted_at IS NULL`, value, id)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrObservationNotFound
+	}
+	return nil
+}
+
+func (s *Store) recentUnpinnedObservations(project, scope string, limit int) ([]Observation, error) {
+	project, _ = NormalizeProject(project)
+	if limit <= 0 {
+		limit = s.cfg.MaxContextResults
+	}
+
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL AND o.pinned = 0
+	`
+	args := []any{}
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	if scope != "" {
+		query += " AND o.scope = ?"
+		args = append(args, normalizeScope(scope))
+	}
+	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC LIMIT ?"
+	args = append(args, limit)
+	return s.queryObservations(query, args...)
+}
+
 // ObservationsNeedingReview returns non-deleted observations whose review_after has passed.
 // An empty project searches all projects, matching existing browse/search conventions.
 func (s *Store) ObservationsNeedingReview(project string, limit int) ([]Observation, error) {
@@ -2426,8 +2502,7 @@ func (s *Store) ObservationsNeedingReview(project string, limit int) ([]Observat
 		limit = s.cfg.MaxContextResults
 	}
 	query := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.created_at, o.updated_at, o.deleted_at
+		SELECT ` + observationSelectColumns + `
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 		  AND o.review_after IS NOT NULL
@@ -3068,7 +3143,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 				if err := tkRows.Scan(
 					&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
 					&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
-					&sr.LastSeenAt, &sr.ReviewAfter, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+					&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 				); err != nil {
 					break
 				}
@@ -3083,7 +3158,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 
 	sqlQ := `
 		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.created_at, o.updated_at, o.deleted_at,
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
 		       fts.rank
 		FROM observations_fts fts
 		JOIN observations o ON o.id = fts.rowid
@@ -3127,7 +3202,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		if err := rows.Scan(
 			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
 			&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
-			&sr.LastSeenAt, &sr.ReviewAfter, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 			&sr.Rank,
 		); err != nil {
 			return nil, err
@@ -3212,7 +3287,12 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		return "", err
 	}
 
-	observations, err := s.RecentObservations(project, scope, s.cfg.MaxContextResults)
+	pinned, err := s.PinnedObservations(project, scope)
+	if err != nil {
+		return "", err
+	}
+
+	observations, err := s.recentUnpinnedObservations(project, scope, s.cfg.MaxContextResults)
 	if err != nil {
 		return "", err
 	}
@@ -3222,7 +3302,7 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		return "", err
 	}
 
-	if len(sessions) == 0 && len(observations) == 0 && len(prompts) == 0 {
+	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 {
 		return "", nil
 	}
 
@@ -3246,6 +3326,15 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 		b.WriteString("### Recent User Prompts\n")
 		for _, p := range prompts {
 			fmt.Fprintf(&b, "- %s: %s\n", timeutil.FormatLocal(p.CreatedAt), truncate(p.Content, 200))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(pinned) > 0 {
+		b.WriteString("### Pinned\n")
+		for _, obs := range pinned {
+			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
+				obs.Type, obs.Title, truncate(obs.Content, 300))
 		}
 		b.WriteString("\n")
 	}
@@ -3342,11 +3431,7 @@ func (s *Store) exportWithProjectScope(project string) (*ExportData, error) {
 	defer obsRows.Close()
 	for obsRows.Next() {
 		var o Observation
-		if err := obsRows.Scan(
-			&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.ReviewAfter,
-			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
-		); err != nil {
+		if err := scanObservationRow(obsRows, &o); err != nil {
 			return nil, err
 		}
 		data.Observations = append(data.Observations, o)
@@ -5787,7 +5872,7 @@ func scanObservationRow(scanner observationScanner, o *Observation) error {
 	return scanner.Scan(
 		&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
 		&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.ReviewAfter,
-		&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
+		&o.Pinned, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 	)
 }
 
@@ -5987,6 +6072,7 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			revision_count INTEGER NOT NULL DEFAULT 1,
 			duplicate_count INTEGER NOT NULL DEFAULT 1,
 			last_seen_at TEXT,
+			pinned     BOOLEAN NOT NULL DEFAULT 0,
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
@@ -6000,7 +6086,7 @@ func (s *Store) migrateLegacyObservationsTable() error {
 		INSERT INTO observations_migrated (
 			id, sync_id, session_id, type, title, content, tool_name, project,
 			scope, topic_key, normalized_hash, revision_count, duplicate_count,
-			last_seen_at, created_at, updated_at, deleted_at
+			last_seen_at, pinned, created_at, updated_at, deleted_at
 		)
 		SELECT
 			CASE
@@ -6021,6 +6107,7 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			CASE WHEN revision_count IS NULL OR revision_count < 1 THEN 1 ELSE revision_count END,
 			CASE WHEN duplicate_count IS NULL OR duplicate_count < 1 THEN 1 ELSE duplicate_count END,
 			last_seen_at,
+			0,
 			COALESCE(NULLIF(created_at, ''), datetime('now')),
 			COALESCE(NULLIF(updated_at, ''), NULLIF(created_at, ''), datetime('now')),
 			deleted_at

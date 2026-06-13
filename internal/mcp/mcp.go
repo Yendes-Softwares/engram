@@ -112,6 +112,8 @@ var ProfileAgent = map[string]bool{
 	"mem_compare":           true, // persist an agent-judged semantic verdict via JudgeBySemantic (REQ-011, Phase G)
 	"mem_doctor":            true, // read-only operational diagnostics for agents
 	"mem_review":            true, // list/mark observations whose review_after lifecycle is stale
+	"mem_pin":               true, // local pin for context priority
+	"mem_unpin":             true, // local unpin for context priority
 }
 
 // ProfileAdmin contains tools for TUI, dashboards, and manual curation
@@ -183,7 +185,7 @@ CORE TOOLS (always available — use without ToolSearch):
   mem_current_project — detect current project from cwd (recommended first call)
 
 DEFERRED TOOLS (use ToolSearch when needed):
-  mem_update, mem_review, mem_suggest_topic_key, mem_session_start, mem_session_end,
+  mem_update, mem_review, mem_pin, mem_unpin, mem_suggest_topic_key, mem_session_start, mem_session_end,
   mem_stats, mem_delete, mem_timeline, mem_capture_passive, mem_merge_projects
 
 PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.
@@ -495,6 +497,38 @@ Examples:
 				),
 			),
 			queuedWriteHandler(writeQueue, handleSavePrompt(s, cfg, activity)),
+		)
+	}
+
+	// ─── mem_pin / mem_unpin (profile: agent, deferred) ──────────────────
+	if shouldRegister("mem_pin", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_pin",
+				mcp.WithDescription("Pin a local observation so it appears before recent observations in memory context. Pinned state is local to this device and is not synced."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Pin Memory"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("id", mcp.Required(), mcp.Description("Observation ID to pin")),
+			),
+			handlePin(s, true),
+		)
+	}
+	if shouldRegister("mem_unpin", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_unpin",
+				mcp.WithDescription("Unpin a local observation so it only appears in normal recency order. Pinned state is local to this device and is not synced."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Unpin Memory"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("id", mcp.Required(), mcp.Description("Observation ID to unpin")),
+			),
+			handlePin(s, false),
 		)
 	}
 
@@ -1025,6 +1059,7 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 				"type":    r.Type,
 				"state":   r.State(),
 				"scope":   r.Scope,
+				"pinned":  r.Pinned,
 			}
 			if r.Project != nil {
 				entry["project"] = *r.Project
@@ -1091,6 +1126,41 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 
 		// JW4: use respondWithProject for the success path (REQ-314).
 		return respondWithProject(detRes, b.String(), map[string]any{"results": structuredResults}), nil
+	}
+}
+
+func handlePin(s *store.Store, pinned bool) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id := int64(intArg(req, "id", 0))
+		if id == 0 {
+			return mcp.NewToolResultError("id is required"), nil
+		}
+
+		var err error
+		if pinned {
+			err = s.PinObservation(id)
+		} else {
+			err = s.UnpinObservation(id)
+		}
+		if err != nil {
+			return mcp.NewToolResultError("Failed to update pin state: " + err.Error()), nil
+		}
+
+		obs, err := s.GetObservation(id)
+		if err != nil {
+			return mcp.NewToolResultError("Updated pin state but failed to reload observation: " + err.Error()), nil
+		}
+		state := "unpinned"
+		if pinned {
+			state = "pinned"
+		}
+		out, _ := jsonMarshal(map[string]any{
+			"result":  fmt.Sprintf("Memory #%d %s", id, state),
+			"id":      obs.ID,
+			"sync_id": obs.SyncID,
+			"pinned":  obs.Pinned,
+		})
+		return mcp.NewToolResultText(string(out)), nil
 	}
 }
 

@@ -223,7 +223,7 @@ func (m Model) viewSearchResults() string {
 
 	for i := m.Scroll; i < end; i++ {
 		r := m.SearchResults[i]
-		b.WriteString(m.renderObservationListItem(i, r.ID, r.Type, r.Title, r.Content, r.CreatedAt, r.Project, r.State(), r.ReviewAfter))
+		b.WriteString(m.renderObservationListItem(i, r.ID, r.Type, r.Title, r.Content, r.CreatedAt, r.Project, r.State(), r.ReviewAfter, r.Pinned))
 	}
 
 	// Scroll indicator
@@ -266,7 +266,7 @@ func (m Model) viewRecent() string {
 
 	for i := m.Scroll; i < end; i++ {
 		o := m.RecentObservations[i]
-		b.WriteString(m.renderObservationListItem(i, o.ID, o.Type, o.Title, o.Content, o.CreatedAt, o.Project, o.State(), o.ReviewAfter))
+		b.WriteString(m.renderObservationListItem(i, o.ID, o.Type, o.Title, o.Content, o.CreatedAt, o.Project, o.State(), o.ReviewAfter, o.Pinned))
 	}
 
 	if count > visibleItems {
@@ -317,6 +317,10 @@ func (m Model) viewObservationDetail() string {
 	b.WriteString(fmt.Sprintf("%s %s\n",
 		detailLabelStyle.Render("State:"),
 		renderObservationState(obs.State())))
+
+	b.WriteString(fmt.Sprintf("%s %s\n",
+		detailLabelStyle.Render("Pinned:"),
+		detailValueStyle.Render(fmt.Sprintf("%t", obs.Pinned))))
 
 	if obs.ReviewAfter != nil {
 		b.WriteString(fmt.Sprintf("%s %s\n",
@@ -561,7 +565,7 @@ func (m Model) viewSessionDetail() string {
 
 	for i := m.SessionDetailScroll; i < end; i++ {
 		o := m.SessionObservations[i]
-		b.WriteString(m.renderObservationListItem(i, o.ID, o.Type, o.Title, o.Content, o.CreatedAt, o.Project, o.State(), o.ReviewAfter))
+		b.WriteString(m.renderObservationListItem(i, o.ID, o.Type, o.Title, o.Content, o.CreatedAt, o.Project, o.State(), o.ReviewAfter, o.Pinned))
 	}
 
 	if count > visibleItems {
@@ -695,7 +699,7 @@ func (m Model) viewSetup() string {
 
 // ─── Shared Renderers ────────────────────────────────────────────────────────
 
-func (m Model) renderObservationListItem(index int, id int64, obsType, title, content, createdAt string, project *string, state string, reviewAfter *string) string {
+func (m Model) renderObservationListItem(index int, id int64, obsType, title, content, createdAt string, project *string, state string, reviewAfter *string, pinned bool) string {
 	cursor := "  "
 	style := listItemStyle
 	if index == m.Cursor {
@@ -712,12 +716,17 @@ func (m Model) renderObservationListItem(index int, id int64, obsType, title, co
 	if state == "needs_review" {
 		stateBadge = " " + stateWarningBadgeStyle.Render("[needs_review]")
 	}
+	pinBadge := ""
+	if pinned {
+		pinBadge = " " + detailValueStyle.Render("[pinned]")
+	}
 
-	line := fmt.Sprintf("%s%s %s%s %s%s  %s\n",
+	line := fmt.Sprintf("%s%s %s%s%s %s%s  %s\n",
 		cursor,
 		idStyle.Render(fmt.Sprintf("#%-5d", id)),
 		typeBadgeStyle.Render(fmt.Sprintf("[%-12s]", obsType)),
 		stateBadge,
+		pinBadge,
 		style.Render(truncateStr(title, 50)),
 		proj,
 		timestampStyle.Render(localTime(createdAt)))
