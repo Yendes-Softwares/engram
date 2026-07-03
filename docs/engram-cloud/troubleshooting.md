@@ -307,7 +307,14 @@ Do not manually edit SQLite without a backup.
 | `--issue-token requires ENGRAM_CLOUD_TOKEN_PEPPER to be configured` | `--issue-token` was passed without `ENGRAM_CLOUD_TOKEN_PEPPER` set. | Set `ENGRAM_CLOUD_TOKEN_PEPPER` to a dedicated secret (distinct from `ENGRAM_JWT_SECRET`) and re-run. No admin/user was created by the failed attempt. |
 | `connect cloud store` | `ENGRAM_DATABASE_URL` is missing/unreachable, same as any other `engram cloud` database command. | Verify `ENGRAM_DATABASE_URL` and that Postgres is reachable, same as `engram cloud serve`. |
 
-Rollback / legacy migration path: `engram cloud bootstrap admin` only adds new `cloud_principals`/`cloud_human_users`/`cloud_principal_tokens`/`cloud_project_grants` rows — it never disables `ENGRAM_CLOUD_TOKEN` or `ENGRAM_CLOUD_ADMIN`. If you want to stop using managed admins/tokens, simply keep using the legacy env credentials; no migration or rollback command is required to fall back. See [DOCS.md — Managed users, tokens, and CLI bootstrap](../../DOCS.md#managed-users-tokens-and-cli-bootstrap-preview) for the current preview limitation (server-side managed-token authentication is not wired into `engram cloud serve` yet).
+Rollback / legacy migration path: `engram cloud bootstrap admin` only adds new `cloud_principals`/`cloud_human_users`/`cloud_principal_tokens`/`cloud_project_grants` rows — it never disables `ENGRAM_CLOUD_TOKEN` or `ENGRAM_CLOUD_ADMIN`. If you want to stop using managed admins/tokens, simply keep using the legacy env credentials (or unset `ENGRAM_CLOUD_TOKEN_PEPPER` to disable managed-token authentication entirely); no migration or rollback command is required to fall back. See [DOCS.md — Managed users, tokens, and CLI bootstrap](../../DOCS.md#managed-users-tokens-and-cli-bootstrap) for how `engram cloud serve` resolves managed tokens first, then legacy env-token credentials.
+
+## Managed-token runtime authentication errors
+
+| Symptom | Cause | Next step |
+|---|---|---|
+| A managed token returns `401` against `/sync/*` or `/admin/*` | `ENGRAM_CLOUD_TOKEN_PEPPER` is not set on the server, the token was revoked, or the owning managed user is disabled. | Confirm `ENGRAM_CLOUD_TOKEN_PEPPER` is set on the running `engram cloud serve` process (must match at issuance and at runtime) and that the token/user has not been revoked/disabled. |
+| A managed token returns `403` against `/sync/*` | The managed principal has no project grant for the requested project (deny-by-default). | Grant the project via `engram cloud bootstrap admin --grant-project <project>` or the dashboard/`/admin/*` grant routes. |
 
 ---
 
