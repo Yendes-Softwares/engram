@@ -28,14 +28,14 @@ Risks and dependencies:
 
 ### PR 1 — Storage and auth foundation
 
-- [ ] RED: Add cloudstore migration tests in `internal/cloud/cloudstore/` proving additive creation of `cloud_principals`, `cloud_human_users`, `cloud_principal_tokens`, `cloud_project_grants`, and `cloud_auth_audit_log` without altering existing sync tables.
-- [ ] GREEN: Extend `internal/cloud/cloudstore/cloudstore.go` migrations and add focused store methods for principal CRUD, human user create/list/enable/disable, token metadata create/list/revoke, project grant create/list/revoke, admin existence checks, and auth audit insertion.
+- [x] RED: Add cloudstore migration tests in `internal/cloud/cloudstore/` proving additive creation of `cloud_principals`, `cloud_human_users`, `cloud_principal_tokens`, `cloud_project_grants`, and `cloud_auth_audit_log` without altering existing sync tables.
+- [x] GREEN: Extend `internal/cloud/cloudstore/cloudstore.go` migrations and add focused store methods for principal CRUD, human user create/list/enable/disable, token metadata create/list/revoke, project grant create/list/revoke, admin existence checks, and auth audit insertion.
 - [x] RED: Add `internal/cloud/auth` tests for `Principal`, `PrincipalKind`, roles, token generation format, HMAC verifier behavior, constant-time verification, revoked/disabled rejection, and legacy env principal resolution.
 - [x] GREEN: Implement principal domain types, dedicated token pepper configuration, token generator, token hasher/verifier, and resolver interfaces in `internal/cloud/auth/`.
-- [ ] TRIANGULATE: Add error-path tests for duplicate usernames/emails, invalid roles/kinds, duplicate grants, revoked tokens, missing pepper, and hash-only persistence.
-- [ ] REFACTOR: Keep storage interfaces small so `internal/cloud/cloudserver` can depend on auth/store contracts without importing dashboard rendering logic.
-- [ ] Verify: `go test ./internal/cloud/auth ./internal/cloud/cloudstore` and `go test ./...`.
-- [ ] Rollback boundary: revert new migrations and auth foundation only; legacy env-token sync remains untouched.
+- [x] TRIANGULATE: Add error-path tests for duplicate usernames/emails, invalid roles/kinds, duplicate grants, revoked tokens, missing pepper, and hash-only persistence.
+- [x] REFACTOR: Keep storage interfaces small so `internal/cloud/cloudserver` can depend on auth/store contracts without importing dashboard rendering logic.
+- [x] Verify: `go test ./internal/cloud/auth ./internal/cloud/cloudstore` and `go test ./...`.
+- [x] Rollback boundary: revert new migrations and auth foundation only; legacy env-token sync remains untouched.
 
 ### PR 2 — Server middleware and sync grant enforcement
 
