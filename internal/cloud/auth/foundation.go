@@ -37,9 +37,16 @@ const managedTokenDomainSeparator = "engram-cloud-token:v1:"
 const managedTokenSecretBytes = 32
 const managedTokenPrefixBytes = 4
 
+// managedTokenPepperMinBytes is the minimum accepted length for a dedicated
+// cloud token pepper, matching the precedent set by auth.NewService's JWT
+// secret length check (ErrSecretTooShort, also 32 bytes). A too-short pepper
+// would be silently accepted as an HMAC key otherwise.
+const managedTokenPepperMinBytes = 32
+
 var cryptoRandRead = rand.Read
 
 var ErrTokenPepperRequired = errors.New("dedicated cloud token pepper is required")
+var ErrTokenPepperTooShort = fmt.Errorf("dedicated cloud token pepper must be at least %d bytes", managedTokenPepperMinBytes)
 var ErrManagedTokenRequired = errors.New("managed token is required")
 var ErrUnknownToken = errors.New("unknown token")
 var ErrTokenRevoked = errors.New("token is revoked")
@@ -182,6 +189,9 @@ func normalizeManagedTokenEnvironment(environment string) string {
 func NewManagedTokenHasher(pepper []byte) (*ManagedTokenHasher, error) {
 	if len(pepper) == 0 {
 		return nil, ErrTokenPepperRequired
+	}
+	if len(pepper) < managedTokenPepperMinBytes {
+		return nil, ErrTokenPepperTooShort
 	}
 	copied := make([]byte, len(pepper))
 	copy(copied, pepper)

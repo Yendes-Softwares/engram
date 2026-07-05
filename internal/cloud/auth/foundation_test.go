@@ -99,6 +99,31 @@ func TestGenerateManagedTokenNormalizesEnvironmentAndReportsRandomFailures(t *te
 	})
 }
 
+// TestManagedTokenHasherRejectsTooShortPepper proves a non-empty but
+// too-short pepper (e.g. a 1-char ENGRAM_CLOUD_TOKEN_PEPPER) is rejected
+// instead of silently being accepted as the HMAC key, matching the
+// precedent set by auth.NewService's JWT secret length check.
+func TestManagedTokenHasherRejectsTooShortPepper(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pepper []byte
+	}{
+		{"one byte", []byte("x")},
+		{"31 bytes (one short of minimum)", []byte(strings.Repeat("a", managedTokenPepperMinBytes-1))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewManagedTokenHasher(tc.pepper); !errors.Is(err, ErrTokenPepperTooShort) {
+				t.Fatalf("expected ErrTokenPepperTooShort for %d-byte pepper, got %v", len(tc.pepper), err)
+			}
+		})
+	}
+
+	// Exactly the minimum length must be accepted.
+	if _, err := NewManagedTokenHasher([]byte(strings.Repeat("a", managedTokenPepperMinBytes))); err != nil {
+		t.Fatalf("expected exactly-minimum-length pepper to be accepted, got %v", err)
+	}
+}
+
 func TestManagedTokenHasherRequiresDedicatedPepperAndUsesDomainSeparatedHMAC(t *testing.T) {
 	if _, err := NewManagedTokenHasher(nil); !errors.Is(err, ErrTokenPepperRequired) {
 		t.Fatalf("expected ErrTokenPepperRequired, got %v", err)

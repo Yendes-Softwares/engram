@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,12 +19,29 @@ import (
 type adminTestStore struct {
 	fakeStore
 
-	users         []cloudstore.HumanUser
-	tokens        []cloudstore.PrincipalToken
-	grants        []cloudstore.ProjectGrant
-	auditEvents   []cloudstore.AuthAuditEvent
-	auditErr      error
-	createUserErr error
+	users             []cloudstore.HumanUser
+	tokens            []cloudstore.PrincipalToken
+	grants            []cloudstore.ProjectGrant
+	auditEvents       []cloudstore.AuthAuditEvent
+	auditErr          error
+	createUserErr     error
+	listHumanUsersErr error
+
+	// auditMu guards auditEvents against concurrent InsertAuthAuditEvent
+	// calls. Real cloudstore-backed audit inserts are independent Postgres
+	// INSERTs with no shared in-process state; this fake's plain slice needs
+	// its own lock to be safely callable from concurrent goroutines (see
+	// TestDashboardBootstrapSubmitConcurrentRequestsCreateExactlyOneAdmin).
+	auditMu sync.Mutex
+
+	// PR4 review remediation (FIX C): per-method error injection so tests can
+	// prove mutation handlers surface store failures as errors instead of
+	// partial success, without adding a partial-success audit event.
+	setEnabledErr  error
+	createTokenErr error
+	revokeTokenErr error
+	createGrantErr error
+	revokeGrantErr error
 
 	createUserCalls  int
 	setEnabledCalls  int
@@ -59,11 +77,17 @@ func (s *adminTestStore) CreateHumanUser(_ context.Context, params cloudstore.Cr
 }
 
 func (s *adminTestStore) ListHumanUsers(context.Context) ([]cloudstore.HumanUser, error) {
+	if s.listHumanUsersErr != nil {
+		return nil, s.listHumanUsersErr
+	}
 	return append([]cloudstore.HumanUser(nil), s.users...), nil
 }
 
 func (s *adminTestStore) SetHumanUserEnabled(_ context.Context, principalID string, enabled bool) error {
 	s.setEnabledCalls++
+	if s.setEnabledErr != nil {
+		return s.setEnabledErr
+	}
 	for i := range s.users {
 		if s.users[i].PrincipalID == principalID {
 			s.users[i].Enabled = enabled
@@ -75,6 +99,9 @@ func (s *adminTestStore) SetHumanUserEnabled(_ context.Context, principalID stri
 
 func (s *adminTestStore) CreatePrincipalToken(_ context.Context, params cloudstore.CreatePrincipalTokenParams) (cloudstore.PrincipalToken, error) {
 	s.createTokenCalls++
+	if s.createTokenErr != nil {
+		return cloudstore.PrincipalToken{}, s.createTokenErr
+	}
 	token := cloudstore.PrincipalToken{
 		ID:                   "tok-" + params.PrincipalID,
 		PrincipalID:          strings.TrimSpace(params.PrincipalID),
@@ -100,6 +127,9 @@ func (s *adminTestStore) ListPrincipalTokens(_ context.Context, principalID stri
 
 func (s *adminTestStore) RevokePrincipalToken(_ context.Context, tokenID, revokedByPrincipalID, reason string) error {
 	s.revokeTokenCalls++
+	if s.revokeTokenErr != nil {
+		return s.revokeTokenErr
+	}
 	now := time.Date(2026, 7, 3, 12, 2, 0, 0, time.UTC)
 	for i := range s.tokens {
 		if s.tokens[i].ID == tokenID {
@@ -114,6 +144,9 @@ func (s *adminTestStore) RevokePrincipalToken(_ context.Context, tokenID, revoke
 
 func (s *adminTestStore) CreateProjectGrant(_ context.Context, params cloudstore.CreateProjectGrantParams) (cloudstore.ProjectGrant, error) {
 	s.createGrantCalls++
+	if s.createGrantErr != nil {
+		return cloudstore.ProjectGrant{}, s.createGrantErr
+	}
 	grant := cloudstore.ProjectGrant{
 		PrincipalID:          strings.TrimSpace(params.PrincipalID),
 		Project:              strings.TrimSpace(params.Project),
@@ -136,6 +169,9 @@ func (s *adminTestStore) ListProjectGrants(_ context.Context, principalID string
 
 func (s *adminTestStore) RevokeProjectGrant(_ context.Context, principalID, project string) error {
 	s.revokeGrantCalls++
+	if s.revokeGrantErr != nil {
+		return s.revokeGrantErr
+	}
 	kept := s.grants[:0]
 	for _, grant := range s.grants {
 		if grant.PrincipalID == principalID && grant.Project == project {
@@ -147,17 +183,25 @@ func (s *adminTestStore) RevokeProjectGrant(_ context.Context, principalID, proj
 	return nil
 }
 
+// InsertAuthAuditEvent replicates the real cloudstore.InsertAuthAuditEvent
+// validation (actor source is required) so tests catch call sites that would
+// silently fail to persist an audit event against the production store.
 func (s *adminTestStore) InsertAuthAuditEvent(_ context.Context, event cloudstore.AuthAuditEvent) error {
 	if s.auditErr != nil {
 		return s.auditErr
 	}
+	if strings.TrimSpace(event.ActorSource) == "" {
+		return errors.New("actor source is required")
+	}
+	s.auditMu.Lock()
+	defer s.auditMu.Unlock()
 	s.auditEvents = append(s.auditEvents, event)
 	return nil
 }
 
 func adminHandlerTestServer(t *testing.T, principal cloudauth.Principal, store *adminTestStore) *CloudServer {
 	t.Helper()
-	hasher, err := cloudauth.NewManagedTokenHasher([]byte("test-token-pepper"))
+	hasher, err := cloudauth.NewManagedTokenHasher([]byte("test-token-pepper-at-least-32-bytes"))
 	if err != nil {
 		t.Fatalf("new token hasher: %v", err)
 	}
@@ -338,6 +382,142 @@ func TestAdminHandlersManageUsersTokensAndGrantsWithRedactedResponses(t *testing
 	}
 	if store.tokens[0].RevokedAt == nil || store.tokens[0].RevokedByPrincipalID != "p-admin" || store.tokens[0].RevocationReason != "lost" {
 		t.Fatalf("expected token revoked with actor and reason, got %+v", store.tokens[0])
+	}
+}
+
+func TestAdminCreateTokenRejectsUnknownManagedUserWithoutMinting(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/users/p-missing/tokens", `{"name":"laptop"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown managed user token create, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "raw_token") || strings.Contains(body, "egc_live_") {
+		t.Fatalf("unknown-user rejection must not expose raw token material, body=%q", body)
+	}
+	if store.createTokenCalls != 0 {
+		t.Fatalf("unknown-user rejection must happen before CreatePrincipalToken, got %d calls", store.createTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("unknown-user rejection must not persist token metadata, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("unknown-user rejection must not record token.create success audit, got %+v", event)
+		}
+	}
+}
+
+func TestAdminCreateTokenRejectsDisabledManagedUserWithoutMinting(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-disabled", Username: "disabled", DisplayName: "Disabled", Role: "member", Enabled: false})
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/users/p-disabled/tokens", `{"name":"laptop"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 conflict for disabled managed user token create, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "raw_token") || strings.Contains(body, "egc_live_") {
+		t.Fatalf("disabled-user rejection must not expose raw token material, body=%q", body)
+	}
+	if store.createTokenCalls != 0 {
+		t.Fatalf("disabled-user rejection must happen before CreatePrincipalToken, got %d calls", store.createTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("disabled-user rejection must not persist token metadata, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("disabled-user rejection must not record token.create success audit, got %+v", event)
+		}
+	}
+}
+
+func TestAdminCreateTokenListUsersFailureFailsClosedBeforeMinting(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	store.listHumanUsersErr = errors.New("list unavailable")
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/users/p-target/tokens", `{"name":"laptop"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when user listing fails before token create, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "raw_token") || strings.Contains(body, "egc_live_") {
+		t.Fatalf("list failure must not expose raw token material, body=%q", body)
+	}
+	if store.createTokenCalls != 0 {
+		t.Fatalf("list failure must happen before CreatePrincipalToken, got %d calls", store.createTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("list failure must not persist token metadata, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("list failure must not record token.create success audit, got %+v", event)
+		}
+	}
+}
+
+func TestAdminCreateTokenStoreDisabledRaceReturns409WithoutPersistingOrAuditing(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-race", Username: "race", DisplayName: "Race", Role: "member", Enabled: true})
+	store.createTokenErr = cloudstore.ErrPrincipalDisabled
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/users/p-race/tokens", `{"name":"laptop"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when store rejects disabled principal after pre-check, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "raw_token") || strings.Contains(body, "egc_live_") {
+		t.Fatalf("store-level disabled rejection must not expose raw token material, body=%q", body)
+	}
+	if store.createTokenCalls != 1 {
+		t.Fatalf("expected store boundary to be reached once for race simulation, got %d calls", store.createTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("store-level disabled rejection must not persist token metadata, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("store-level disabled rejection must not record token.create success audit, got %+v", event)
+		}
+	}
+}
+
+func TestAdminCreateTokenStoreNotFoundRaceReturns404WithoutPersistingOrAuditing(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-race", Username: "race", DisplayName: "Race", Role: "member", Enabled: true})
+	store.createTokenErr = cloudstore.ErrPrincipalNotFound
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/users/p-race/tokens", `{"name":"laptop"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when store cannot find principal after pre-check, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "raw_token") || strings.Contains(body, "egc_live_") {
+		t.Fatalf("store-level not-found rejection must not expose raw token material, body=%q", body)
+	}
+	if store.createTokenCalls != 1 {
+		t.Fatalf("expected store boundary to be reached once for race simulation, got %d calls", store.createTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("store-level not-found rejection must not persist token metadata, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("store-level not-found rejection must not record token.create success audit, got %+v", event)
+		}
 	}
 }
 

@@ -198,6 +198,16 @@ func (s *CloudServer) handleAdminCreateToken(w http.ResponseWriter, r *http.Requ
 		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid token payload: %v", err))
 		return
 	}
+	if user, found, err := findManagedUserByPrincipalID(r.Context(), store, principalID); err != nil {
+		writeActionableError(w, http.StatusInternalServerError, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeInternal, fmt.Sprintf("list users: %v", err))
+		return
+	} else if !found {
+		writeActionableError(w, http.StatusNotFound, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, "managed user not found")
+		return
+	} else if !user.Enabled {
+		writeActionableError(w, http.StatusConflict, constants.UpgradeErrorClassPolicy, constants.ReasonPolicyForbidden, disabledManagedUserTokenMessage(principalID))
+		return
+	}
 	managedToken, err := cloudauth.GenerateManagedToken("live")
 	if err != nil {
 		writeActionableError(w, http.StatusInternalServerError, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeInternal, fmt.Sprintf("generate token: %v", err))
@@ -210,6 +220,14 @@ func (s *CloudServer) handleAdminCreateToken(w http.ResponseWriter, r *http.Requ
 	}
 	token, err := store.CreatePrincipalToken(r.Context(), cloudstore.CreatePrincipalTokenParams{PrincipalID: principalID, TokenPrefix: managedToken.Prefix, TokenHash: tokenHash, Name: req.Name, CreatedByPrincipalID: actor.ID})
 	if err != nil {
+		if errors.Is(err, cloudstore.ErrPrincipalDisabled) {
+			writeActionableError(w, http.StatusConflict, constants.UpgradeErrorClassPolicy, constants.ReasonPolicyForbidden, disabledManagedUserTokenMessage(principalID))
+			return
+		}
+		if errors.Is(err, cloudstore.ErrPrincipalNotFound) {
+			writeActionableError(w, http.StatusNotFound, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, "managed user not found")
+			return
+		}
 		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("create token: %v", err))
 		return
 	}
@@ -218,6 +236,23 @@ func (s *CloudServer) handleAdminCreateToken(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	jsonResponse(w, http.StatusCreated, map[string]any{"raw_token": managedToken.Raw, "token": sanitizeToken(token)})
+}
+
+func findManagedUserByPrincipalID(ctx context.Context, store AdminIdentityStore, principalID string) (cloudstore.HumanUser, bool, error) {
+	users, err := store.ListHumanUsers(ctx)
+	if err != nil {
+		return cloudstore.HumanUser{}, false, err
+	}
+	for _, user := range users {
+		if user.PrincipalID == principalID {
+			return user, true, nil
+		}
+	}
+	return cloudstore.HumanUser{}, false, nil
+}
+
+func disabledManagedUserTokenMessage(principalID string) string {
+	return fmt.Sprintf("managed user %q is disabled; enable the user before creating a managed token", principalID)
 }
 
 func (s *CloudServer) handleAdminRevokeToken(w http.ResponseWriter, r *http.Request) {
