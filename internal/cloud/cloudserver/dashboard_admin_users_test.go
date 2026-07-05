@@ -183,6 +183,23 @@ func TestDashboardManagedUserDetailPageRendersTokensAndGrants(t *testing.T) {
 	}
 }
 
+func TestDashboardManagedUserDetailPageDisabledUserHidesTokenCreateForm(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-disabled", Username: "disabled-user", Role: "member", Enabled: false})
+
+	rec := performDashboardRequest(srv, http.MethodGet, "/dashboard/admin/users/p-disabled", cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for disabled managed user detail page, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `action="/dashboard/admin/users/p-disabled/tokens"`) || strings.Contains(body, "Create Token") {
+		t.Fatalf("disabled managed user detail page must not present active token creation affordance, body=%q", body)
+	}
+	if !strings.Contains(body, "Enable this managed user before creating a managed token.") {
+		t.Fatalf("expected inline disabled-user token creation guidance, body=%q", body)
+	}
+}
+
 // TestDashboardCreateManagedTokenShowsRawTokenOnceAndSanitizesFutureViews
 // proves the show-once contract end to end: the token-created response body
 // contains the raw token exactly once, is a direct POST response (never a
@@ -384,6 +401,124 @@ func TestDashboardCreateManagedTokenForUnknownUserReturns404NoMintNoAudit(t *tes
 	for _, event := range store.auditEvents {
 		if event.Action == authAuditActionTokenCreate {
 			t.Fatalf("expected no token.create audit event for an unknown user, got %+v", event)
+		}
+	}
+}
+
+func TestDashboardCreateManagedTokenRejectsDisabledUserWithStyledErrorWithoutMinting(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-disabled", Username: "disabled-user", Role: "member", Enabled: false})
+
+	rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/users/p-disabled/tokens", "name=laptop", cookie, false)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 conflict for disabled managed user token create, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if contentType := rec.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/html") {
+		t.Fatalf("expected disabled-user rejection to render a dashboard HTML page, got Content-Type=%q body=%q", contentType, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, marker := range []string{"<!doctype html>", "Engram Cloud", "Cannot Create Token", "Enable this managed user before creating a managed token.", "disabled-user"} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("expected styled disabled-user error page marker %q, body=%q", marker, body)
+		}
+	}
+	if strings.Contains(body, "egc_live_") || strings.Contains(body, "token-reveal") {
+		t.Fatalf("disabled-user rejection must not render raw token material, body=%q", body)
+	}
+	if store.createTokenCalls != 0 {
+		t.Fatalf("disabled-user rejection must happen before CreatePrincipalToken, got %d calls", store.createTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("disabled-user rejection must not persist token metadata, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("disabled-user rejection must not record token.create success audit, got %+v", event)
+		}
+	}
+}
+
+func TestDashboardCreateManagedTokenListUsersFailureFailsClosedBeforeMinting(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+	store.listHumanUsersErr = errors.New("list unavailable")
+
+	rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/users/p-target/tokens", "name=laptop", cookie, false)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when user listing fails before token create, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "egc_live_") || strings.Contains(body, "token-reveal") {
+		t.Fatalf("list failure must not render raw token material, body=%q", body)
+	}
+	if store.createTokenCalls != 0 {
+		t.Fatalf("list failure must happen before CreatePrincipalToken, got %d calls", store.createTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("list failure must not persist token metadata, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("list failure must not record token.create success audit, got %+v", event)
+		}
+	}
+}
+
+func TestDashboardCreateManagedTokenStoreDisabledRaceReturns409WithoutPersistingOrAuditing(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-race", Username: "race", Role: "member", Enabled: true})
+	store.createTokenErr = cloudstore.ErrPrincipalDisabled
+
+	rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/users/p-race/tokens", "name=laptop", cookie, false)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when store rejects disabled principal after pre-check, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if contentType := rec.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/html") {
+		t.Fatalf("expected store-level disabled rejection to render a dashboard HTML page, got Content-Type=%q body=%q", contentType, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, marker := range []string{"<!doctype html>", "Engram Cloud", "Cannot Create Token", "Enable this managed user before creating a managed token.", "race"} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("expected styled store-level disabled error page marker %q, body=%q", marker, body)
+		}
+	}
+	if strings.Contains(body, "egc_live_") || strings.Contains(body, "token-reveal") {
+		t.Fatalf("store-level disabled rejection must not render raw token material, body=%q", body)
+	}
+	if store.createTokenCalls != 1 {
+		t.Fatalf("expected store boundary to be reached once for race simulation, got %d calls", store.createTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("store-level disabled rejection must not persist token metadata, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("store-level disabled rejection must not record token.create success audit, got %+v", event)
+		}
+	}
+}
+
+func TestDashboardCreateManagedTokenStoreNotFoundRaceReturns404WithoutPersistingOrAuditing(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-race", Username: "race", Role: "member", Enabled: true})
+	store.createTokenErr = cloudstore.ErrPrincipalNotFound
+
+	rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/users/p-race/tokens", "name=laptop", cookie, false)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when store cannot find principal after pre-check, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "egc_live_") || strings.Contains(body, "token-reveal") {
+		t.Fatalf("store-level not-found rejection must not render raw token material, body=%q", body)
+	}
+	if store.createTokenCalls != 1 {
+		t.Fatalf("expected store boundary to be reached once for race simulation, got %d calls", store.createTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("store-level not-found rejection must not persist token metadata, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("store-level not-found rejection must not record token.create success audit, got %+v", event)
 		}
 	}
 }

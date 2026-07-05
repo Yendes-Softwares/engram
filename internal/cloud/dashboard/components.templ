@@ -1010,13 +1010,23 @@ templ ManagedUserDetailPage(user cloudstore.HumanUser, tokens []cloudstore.Princ
 		</div>
 		<h3 class="section-block-title">Tokens</h3>
 		<div class="data-frame">
-			<form method="post" action={ templ.SafeURL("/dashboard/admin/users/" + url.PathEscape(user.PrincipalID) + "/tokens") } class="managed-user-form">
-				<input type="text" name="name" placeholder="Token label (optional)" autocomplete="off"/>
-				<button type="submit">Create Token</button>
-			</form>
-			<p class="muted">Tokens are shown only once, immediately after creation. Engram Cloud cannot redisplay a raw token afterward — revoke it and create a new one if it is lost.</p>
+			if user.Enabled {
+				<form method="post" action={ templ.SafeURL("/dashboard/admin/users/" + url.PathEscape(user.PrincipalID) + "/tokens") } class="managed-user-form">
+					<input type="text" name="name" placeholder="Token label (optional)" autocomplete="off"/>
+					<button type="submit">Create Token</button>
+				</form>
+				<p class="muted">Tokens are shown only once, immediately after creation. Engram Cloud cannot redisplay a raw token afterward — revoke it and create a new one if it is lost.</p>
+			} else {
+				<div class="policy-note danger-note">
+					<p><strong>Token creation unavailable.</strong> Enable this managed user before creating a managed token.</p>
+				</div>
+			}
 			if len(tokens) == 0 {
-				@EmptyState("No Tokens", "This user has no managed tokens yet. Create one above to let it authenticate sync requests.")
+				if user.Enabled {
+					@EmptyState("No Tokens", "This user has no managed tokens yet. Create one above to let it authenticate sync requests.")
+				} else {
+					@EmptyState("No Tokens", "This disabled user has no managed tokens. Enable the user before creating one.")
+				}
 			} else {
 				<table class="data-table">
 					<thead>

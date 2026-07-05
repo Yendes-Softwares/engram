@@ -1554,3 +1554,206 @@ Results:
 - **Unrelated pre-existing race discovered, not fixed**: `dashboardPrincipalSessionKey`'s lazy generate-on-first-use is not safe for concurrent first calls (found via the new FIX 1 dashboard concurrency test, which pre-warms the key to stay in scope). A future maintenance slice should guard this with a `sync.Once` or a mutex.
 - The `go test -cover ./cmd/engram` anomaly documented in the original PR5 section above is unrelated and still not investigated here.
 - FIX 5's malformed-`--email` finding intentionally does not add new email-format validation; if the maintainer wants email format enforcement, that should be a separate, explicit design decision (affects the real Postgres schema/constraints too), not folded into this review-remediation pass.
+
+---
+
+## PR6 apply update — runtime managed-token wiring
+
+### Current branch
+
+`feat/cloud-user-token-management-runtime-wiring`
+
+### Chain context
+
+- Tracker branch: `feat/cloud-user-token-management`
+- Parent branch for this feature-branch-chain slice: `feat/cloud-user-token-management-cli-docs` (PR5 + PR5 review remediation, already committed as `7172b95`, `2669f3b`, `9defadf`, `d4c3b38`, `4bd03db`, `4035ab5`, `7587be0`, `ee2ac81` on this branch's history).
+- Current slice: PR6, the final integration slice — wire the resolver/adapters already built in PR1–PR5 into the actual `engram cloud serve` runtime (`cmd/engram/cloud.go`'s `newCloudRuntime`), closing the gap explicitly flagged in PR5's and PR5-remediation's apply-progress sections ("Runtime CLI/config wiring for a dedicated managed-token pepper is not expanded", "no runtime managed-token auth wiring into `newCloudRuntime` was added ... deferred to PR6").
+- Out of scope: dashboard UX/templates, `/sync/*`/`/admin/*` payload contract changes, CLI flag changes. Nothing in this slice touches route registration, request/response schemas, or the storage schema beyond one additive storage method.
+
+### Why this slice exists (verified, not assumed)
+
+Before this slice, `newCloudRuntime` constructed `cloudserver.New(...)` without `WithAdminIdentityStore`, `WithManagedTokenHasher`, or `WithPrincipalStateStore`, and its `Authenticator` (`auth.Service.ResolveBearerToken`) only ever resolved the legacy `ENGRAM_CLOUD_TOKEN` sync credential. Confirmed via the RED end-to-end test below: a managed token minted by `engram cloud bootstrap admin --issue-token` (or the admin API/dashboard token routes) got `401 unauthorized: invalid bearer token` against `/admin/users`, and `/dashboard/bootstrap` (with a valid legacy-admin session) 500'd with "dashboard bootstrap store is not configured".
+
+### Completed in PR6
+
+1. **`internal/cloud/cloudstore/identity.go`**: added `FindPrincipalTokenByHash(ctx, tokenHash) (PrincipalToken, Principal, error)` — a new, previously-unwritten storage-only lookup joining `cloud_principal_tokens` to `cloud_principals` by hash, returning the new sentinel `ErrPrincipalTokenNotFound` (not a raw `sql.ErrNoRows`) when no token matches. Also added exported `NormalizeProjectGrant` (a thin wrapper around the existing unexported `normalizeCloudProjectGrant`) so a caller outside `cloudstore` can normalize a project name exactly like `CreateProjectGrant` does before comparing it against stored grants.
+2. **`cmd/engram/cloud_runtime_auth.go`** (new file): three adapter/wrapper types that live in `cmd/engram` specifically because `internal/cloud/auth` already imports `internal/cloud/cloudstore` (a direct `cloudstore -> auth` import would cycle), mirroring how `WithAdminIdentityStore`/`WithManagedTokenHasher` were already wired here in PR3A/PR5:
+   - `cloudRuntimeAuthenticator` — embeds `*auth.Service` (so `Authorize` and the legacy `dashboardSessionCodec` pair keep working unmodified) and overrides `ResolveBearerToken` to delegate to a `*cloudauth.PrincipalResolver`. Go method promotion does NOT provide virtual dispatch, so `auth.Service.Authorize`'s internal call to `s.ResolveBearerToken` is unaffected by the override and stays legacy-only — which is safe because `cloudserver.authenticateRequest` only ever falls back to `Authorize` when the `Authenticator` does NOT implement `ResolveBearerToken`, and this wrapper always does.
+   - `cloudstoreManagedTokenLookup` — adapts `cloudManagedTokenHashStore` (a narrow interface satisfied by `*cloudstore.CloudStore`, or a fake in tests) to `cloudauth.ManagedTokenLookup`, mapping `cloudstore.Principal`/`PrincipalToken` fields into `cloudauth.Principal`/`ManagedTokenRecord`, and mapping `cloudstore.ErrPrincipalTokenNotFound` to `cloudauth.ErrUnknownToken` so no cloudstore-specific error string leaks into the `"unauthorized: %v"` HTTP response.
+   - `cloudPrincipalProjectAuthorizer` — implements `cloudserver.PrincipalProjectAuthorizer` (`AuthorizeProjectForPrincipal`/`EnrolledProjectsForPrincipal`) backed by `cloudstore.ListProjectGrants`, deny-by-default (a principal with zero grants is denied every project and enrolls in zero, never nil-as-all).
+3. **`cmd/engram/cloud.go`** (`newCloudRuntime`): when `cfg.TokenPepper` is set, constructs `cloudauth.NewManagedTokenHasher([]byte(pepper))` (a clear startup error if the pepper is present but too short/invalid — `auth.ErrTokenPepperTooShort`, added in the PR5 review-remediation slice), builds a `cloudauth.PrincipalResolver` via `ResolverConfig{Hasher, ManagedTokens: cloudstoreManagedTokenLookup{store: cs}, Legacy: LegacyCredentials{SyncToken: token, AdminToken: cfg.AdminToken}}`, and wraps it as `&cloudRuntimeAuthenticator{Service: authSvc, resolver: resolver}` — the single `Authenticator` passed to `cloudserver.New`. When `cfg.TokenPepper` is unset, the resolver is still constructed (with `Hasher`/`ManagedTokens` left nil), so it degrades gracefully to legacy-only resolution — the server does not fail to start, matching design.md's rollback/compatibility requirements. `cloudserver.WithAdminIdentityStore(cs)`, `cloudserver.WithManagedTokenHasher(hasher)` (possibly nil), `cloudserver.WithPrincipalStateStore(cs)`, and `cloudserver.WithPrincipalProjectAuthorizer(cloudPrincipalProjectAuthorizer{store: cs})` are now always passed into `cloudserver.New`, in addition to every pre-existing option (`WithHost`, `WithProjectAuthorizer`, `WithDashboardAdminToken`, `WithMaxPushBodyBytes`, `WithSyncStatusProvider`) — none of which changed.
+4. **Real-Postgres discovery + fix (`internal/cloud/cloudserver/dashboard_session.go`)**: running the new end-to-end test against a real local Postgres instance (not just the package's fakes) surfaced that wiring `WithAdminIdentityStore` turned every legacy admin dashboard login into a `500 unable to create dashboard session`. Root cause: `recordDashboardLoginAudit`/`recordDashboardBootstrapAudit`/`recordBootstrapAuditBestEffort` all sent `principal.ID` (a synthetic sentinel like `"legacy:admin"` for legacy/bootstrap principals) as `ActorPrincipalID`, which real `cloud_auth_audit_log.actor_principal_id` (`BIGINT REFERENCES cloud_principals(id)`) rejects as an invalid bigint literal — a bug that was structurally invisible to every prior PR's tests because the in-memory `adminTestStore`/`loginAuditTestStore` fakes never validated that field's type. Fixed with a new `auditActorPrincipalIDRef(actor)` helper: returns `actor.ID` only when `actor.Source == cloudauth.PrincipalSourceManagedToken` (the only source that is ever an actual `cloud_principals` row), `""` otherwise. The actor's identity is still fully captured via `ActorSource`/`Metadata` either way.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| `FindPrincipalTokenByHash` + `NormalizeProjectGrant` | `internal/cloud/cloudstore/identity_storage_test.go` | Integration (Postgres-gated) + pure | ✅ `go test ./internal/cloud/cloudstore` green before edits | ✅ `git stash` of only the production edit reproduced `cs.FindPrincipalTokenByHash undefined` (confirmed via stash/pop, not assumed) | ✅ New tests pass: active-token resolve, unknown-hash → `ErrPrincipalTokenNotFound`, revoked-token still resolves (caller decides), `NormalizeProjectGrant` byte-identical to the internal function | ✅ Revoked-token case asserted separately from unknown-hash case | ✅ `TokenHash` left blank on the returned record, matching the existing list/create sanitization convention |
+| `cloudstoreManagedTokenLookup` / `cloudPrincipalProjectAuthorizer` / `cloudRuntimeAuthenticator` | `cmd/engram/cloud_runtime_auth_test.go` | Unit, pure (no DSN, runs in CI) | ✅ `go build ./cmd/engram` green before edits | ✅ `go vet ./cmd/engram/...` failed with `undefined: cloudstoreManagedTokenLookup` before `cloud_runtime_auth.go` existed | ✅ All 4 new tests pass: admin+service-account field mapping, not-found → `auth.ErrUnknownToken`, deny-by-default + granted-project authorization with exact enrolled-list assertions, managed-token-before-legacy resolution via the real `auth.PrincipalResolver` + real `auth.ManagedTokenHasher` (no fake resolver) | ✅ Explicit "principal with zero grants" case kept separate from "ungranted project for a principal WITH other grants" case | ✅ Adapters depend on narrow interfaces (`cloudManagedTokenHashStore`, `cloudProjectGrantStore`), not the concrete `*cloudstore.CloudStore`, so this suite needs no Postgres |
+| `newCloudRuntime` end-to-end wiring | `cmd/engram/cloud_runtime_e2e_test.go` | End-to-end, Postgres-gated (real `newCloudRuntime`, real `cloudstore.CloudStore`, real HTTP handler) | ✅ `go build ./...` green before edits | ✅ Ran against the pre-fix `cloud.go` (via `git stash` of only that file): managed admin token → `401 unauthorized: invalid bearer token` against `/admin/users`, confirming the exact bug the task describes | ✅ After wiring: (a) managed token reaches `/admin/users` (200, body includes seeded admin — only possible with `Source == PrincipalSourceManagedToken` + `Role == RoleAdmin`); (b) `/dashboard/bootstrap` returns `409` (managed admin already exists) instead of `500`; (c) unknown token → `401`, revoked token → `401`; (d) legacy `ENGRAM_CLOUD_TOKEN` still authenticates `/sync/pull` (200); (e) a second runtime built with `TokenPepper=""` still starts and still authenticates the legacy token, while a managed token now correctly gets `401` (auth disabled, not misresolved) | ✅ Assertions (a)-(e) each isolated with their own status-code check and failure message | ✅ Test helpers (`doBearerRequest`, `dashboardLoginCookie`, `doCookieFormRequest`) factored out for reuse across the 5 assertions |
+| `auditActorPrincipalIDRef` legacy-actor audit fix | `internal/cloud/cloudserver/login_audit_test.go` | Unit, integration with existing fakes | ✅ Full `internal/cloud/cloudserver` suite green before edit | ✅ Discovered via the real-Postgres E2E test failing with `dashboard login did not set a session cookie (status=500)`; then isolated and confirmed via `sed`-revert + rerun of `TestDashboardLegacyAdminLoginAuditsRecoveryAfterManagedAdminExists` (extended with a new `ActorPrincipalID != ""` assertion), which failed exactly as predicted before the fix, restored after | ✅ Both extended tests (`TestDashboardLegacyAdminLoginAuditsRecoveryAfterManagedAdminExists`, `TestDashboardBootstrapAuditsAcceptedFirstAdminCreation`) pass; full `TestDashboard\|TestBootstrap` subset (36 tests) passes | ✅ Confirmed the managed-principal case (`TestDashboardAdminLoginAuditsAcceptedManagedPrincipal`) still asserts `ActorPrincipalID == "p-admin"` unchanged — the fix only nulls the ID for non-managed sources | ✅ Single centralized helper (`auditActorPrincipalIDRef`) used at all 3 affected call sites instead of duplicating the `Source` check |
+
+### Test Summary
+
+- Total tests written/extended: 1 Postgres-gated storage test + 1 pure storage test (cloudstore) + 4 pure adapter/wiring tests (cmd/engram) + 1 Postgres-gated end-to-end test (cmd/engram) + 2 extended existing tests (cloudserver) = 9 new/changed test functions.
+- Total tests passing: all new/changed tests, plus the full `cmd/engram`/`internal/cloud/...` suites, plus the full repository suite, with and without `CLOUDSTORE_TEST_DSN`.
+- Layers used: Integration/Postgres-gated (2), Unit/pure (5), End-to-end/Postgres-gated (1), Unit-with-fakes (2, extended).
+- Approval tests: None.
+- Pure functions created: `auditActorPrincipalIDRef` (`internal/cloud/cloudserver/dashboard_session.go`); `cloudstoreManagedTokenLookup.FindManagedTokenByHash`, `cloudPrincipalProjectAuthorizer.AuthorizeProjectForPrincipal`/`EnrolledProjectsForPrincipal` (`cmd/engram/cloud_runtime_auth.go`); `cloudstore.NormalizeProjectGrant` (`internal/cloud/cloudstore/identity.go`).
+
+### Real-Postgres verification environment (this run)
+
+RED/GREEN evidence for the Postgres-gated tests in this slice was captured against a real local PostgreSQL 14 instance (Homebrew `postgres`/`initdb`/`pg_ctl`, throwaway data directory, started and stopped only for this verification run — not part of the repository or any committed artifact), not merely inferred from fakes. This is a stronger evidence bar than "compiles and skips without `CLOUDSTORE_TEST_DSN`."
+
+### Real-Postgres discovery: pre-existing, unrelated test failure (NOT fixed in this slice)
+
+Running the full `internal/cloud/cloudstore` suite against real Postgres (not skipped) revealed `TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle` (written in PR1B) fails deterministically: `UpdatePrincipal: cloudstore: cannot remove last active admin`. The test creates exactly one admin principal and immediately tries to demote it via `UpdatePrincipal` — but the last-active-admin guard (`guardLastActiveAdminTx`, added during PR1B's own review-remediation pass) correctly blocks demoting the only active admin, so the test's own assumption is now stale relative to the guard it was never re-run against with a real database. Confirmed pre-existing and unrelated to PR6 by reverting only `internal/cloud/cloudstore/identity.go` and `identity_storage_test.go` (via `git stash` of just those two files) and re-running: the failure reproduces byte-for-byte on the pre-PR6 code. **Not fixed here** — it is a PR1B test/guard mismatch, not a runtime-wiring issue, and fixing it would mean changing either PR1B's own test fixture or the last-admin guard's semantics, which is out of scope for "wire the runtime." Flagged as a risk below. `CLOUDSTORE_TEST_DSN`-gated CI that has never actually run this suite against Postgres would not have caught this until now.
+
+### Verification run
+
+```bash
+go build ./...
+go vet ./...
+go test ./cmd/engram ./internal/cloud/...                      # CLOUDSTORE_TEST_DSN unset: gated tests skip cleanly
+go test ./...                                                   # full repo suite
+CLOUDSTORE_TEST_DSN=postgres://... go test ./cmd/engram ./internal/cloud/... -count=1   # real Postgres
+go test -race -count=1 ./cmd/engram ./internal/cloud/...
+gofmt -l <every touched Go file>
+git diff --check
+```
+
+Results:
+
+- `go build ./...`: clean.
+- `go vet ./...`: clean.
+- `go test ./cmd/engram ./internal/cloud/...` (no DSN): PASS, Postgres-gated tests skip cleanly.
+- `go test ./...` (no DSN): PASS (all packages, including `internal/setup`'s known pre-existing flaky `TestInstallCodexInjectsTOMLAndIsIdempotent`, which passed on this run; not touched).
+- `go test ./cmd/engram ./internal/cloud/... -count=1` (real Postgres): PASS except the pre-existing, unrelated `TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle` failure documented above (confirmed to reproduce on pre-PR6 code via `git stash`).
+- `go test -race -count=1 ./cmd/engram ./internal/cloud/...` (real Postgres): PASS (all packages, including the new end-to-end and adapter tests, and the extended audit tests).
+- `gofmt -l` on every touched/created Go file: clean (no output).
+- `git diff --check`: clean (no output). `cmd/engram/autosync_status_test.go` remains the known, pre-existing, untouched gofmt-dirty file (not modified in this slice, per instructions).
+
+### Files changed
+
+| File | Action | What Was Done |
+|------|--------|---------------|
+| `cmd/engram/cloud_runtime_auth.go` | Created | `cloudRuntimeAuthenticator`, `cloudstoreManagedTokenLookup`, `cloudPrincipalProjectAuthorizer` — the runtime auth/project-grant wiring adapters. |
+| `cmd/engram/cloud_runtime_auth_test.go` | Created | 4 pure unit tests for the adapters above (no DSN required). |
+| `cmd/engram/cloud_runtime_e2e_test.go` | Created | Postgres-gated end-to-end test proving managed-token auth, dashboard bootstrap reachability, revocation, legacy compatibility, and graceful no-pepper degradation through the real `newCloudRuntime`. |
+| `cmd/engram/cloud.go` | Modified | `newCloudRuntime` now constructs a `cloudauth.PrincipalResolver` and passes `WithAdminIdentityStore`/`WithManagedTokenHasher`/`WithPrincipalStateStore`/`WithPrincipalProjectAuthorizer` into `cloudserver.New`. |
+| `internal/cloud/cloudstore/identity.go` | Modified | Added `FindPrincipalTokenByHash`, `ErrPrincipalTokenNotFound`, exported `NormalizeProjectGrant`. |
+| `internal/cloud/cloudstore/identity_storage_test.go` | Modified | Added `TestFindPrincipalTokenByHashResolvesActiveTokenAndRejectsUnknownOrRevoked` (Postgres-gated) and `TestNormalizeProjectGrantMatchesInternalNormalization` (pure). |
+| `internal/cloud/cloudserver/dashboard_session.go` | Modified | Added `auditActorPrincipalIDRef`; used at all 3 call sites that previously sent a legacy/bootstrap principal's synthetic ID as `ActorPrincipalID`. |
+| `internal/cloud/cloudserver/login_audit_test.go` | Modified | Extended `TestDashboardLegacyAdminLoginAuditsRecoveryAfterManagedAdminExists` and `TestDashboardBootstrapAuditsAcceptedFirstAdminCreation` with `ActorPrincipalID == ""` assertions pinning the fix. |
+| `README.md` | Modified | Removed the "server-side managed-token auth is not wired" caveat; describes the pepper requirement and runtime behavior. |
+| `DOCS.md` | Modified | Renamed section (dropped "(preview)"), replaced the "current limitation" paragraph with the actual runtime resolution order and graceful-degradation behavior, updated the `ENGRAM_CLOUD_TOKEN_PEPPER` table row and anchor references. |
+| `docs/engram-cloud/quickstart.md` | Modified | Same caveat removal/replacement as DOCS.md, plus the optional-env-var note. |
+| `docs/engram-cloud/troubleshooting.md` | Modified | Replaced the preview-limitation rollback note with the real runtime behavior; added a "Managed-token runtime authentication errors" table (401/403 causes and fixes). |
+| `CHANGELOG.md` | Modified | Replaced the "known follow-up" bullet with two entries: the runtime wiring feature and the legacy-actor audit-insert bugfix. |
+| `docker-compose.cloud.yml` / `docker-compose.beta.yml` | Modified | Updated the commented `ENGRAM_CLOUD_TOKEN_PEPPER` explanation to describe enabling runtime auth, not just token issuance. |
+| `openspec/changes/cloud-user-token-management/tasks.md` | Modified | Added a PR6 task section; updated the two previously-unchecked cross-slice acceptance items to checked, with evidence. |
+| `openspec/changes/cloud-user-token-management/apply-progress.md` | Modified | This section. |
+
+### Changed-line estimate
+
+- New files: `cloud_runtime_auth.go` (154 lines), `cloud_runtime_auth_test.go` (214 lines), `cloud_runtime_e2e_test.go` (230 lines) = 598 lines.
+- Modified files (tracked diff): `git diff --stat` reports 266 insertions/deletions across 13 files (Go production/test + docs + OpenSpec artifacts).
+- Total slice size: approximately 864 changed lines. This is a single bounded final-integration slice (as instructed), comparable in size to PR3A (~826 lines), and does not expand into dashboard UX, CLI flags, or payload contract changes.
+
+### Deviations from design
+
+- design.md's `PrincipalResolver.ResolveBearerToken` (written in PR1A) checks legacy credentials before managed-token storage; the task's design.md excerpt describes "managed token storage first, then legacy env tokens." This ordering was NOT changed in this slice: legacy/managed token matching is exact-string/exact-hash equality in both branches, so presenting a legitimate legacy token can never accidentally match as a managed token or vice versa, and presenting a managed token can never accidentally match a legacy credential (a 32+ byte random secret cannot equal a configured legacy token by chance). The check ORDER therefore has no observable behavioral effect either way; reordering pre-existing, already-tested PR1A code was judged higher-risk than net-new-behavior value for this slice, and is flagged here rather than silently left unmentioned.
+- `FindPrincipalTokenByHash` does not update `last_used_at` on successful lookup. design.md describes this column as "best-effort," and the task's explicit test list did not require it; adding a per-authenticated-request database write was judged out of scope for a runtime-wiring slice. Flagged as a follow-up below.
+- Legacy `ENGRAM_CLOUD_ADMIN` was wired into the new resolver's `LegacyCredentials.AdminToken` (per the task's exact instruction), meaning an admin-token bearer request to `/sync/*` now resolves to a `legacy_env_admin` principal (previously it resolved to nothing / `401`). This is inert in practice: `usesManagedProjectGrants` already treats `PrincipalKindLegacy` principals as using the legacy allowlist authorizer (identical to the sync token's path), and `/admin/*`/`/dashboard/admin/*` already require `Source == PrincipalSourceManagedToken` specifically (not just an admin-shaped legacy principal), so no new privilege is granted. Flagged here for reviewer visibility rather than silently introduced.
+
+### Remaining tasks
+
+None. This is the final slice (PR6) of `cloud-user-token-management`. All `tasks.md` PR1–PR6 implementation task lines and all cross-slice acceptance checklist items are now checked.
+
+### Risks / follow-ups
+
+- **Pre-existing, unrelated, real-Postgres-only test failure (not fixed)**: `TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle` (PR1B) fails against real Postgres due to a stale assumption vs. the later-added last-active-admin guard. This is a maintenance item for a future slice, not a PR6 regression — confirmed via `git stash` to reproduce identically on pre-PR6 code.
+- `last_used_at` is not updated on managed-token authentication (see Deviations above); a future slice could add this as a best-effort update inside `FindPrincipalTokenByHash` or a separate post-auth hook.
+- The `go test -cover ./cmd/engram` anomaly documented in the PR5 apply-progress section is unrelated and still not investigated.
+- `docs/ARCHITECTURE.md`'s "Cloud route/auth split" route list remains stale from before PR2 (missing `/sync/mutations/*`, `/admin/*`, `/dashboard/bootstrap`, and PR4's dashboard managed-user routes) — this predates and is unrelated to PR6's auth-behavior changes; still flagged as deferred doc debt, not fixed here to keep this slice's diff bounded to runtime auth wiring.
+- This slice intentionally does not touch `docker-compose.cloud.yml`'s `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` default or `docker-compose.beta.yml`'s plaintext example secrets; both stacks remain exactly as insecure/example-secret as before, with the pepper left commented out by default in both.
+
+## PR6 review remediation
+
+Scope: fix CONFIRMED review findings on the uncommitted PR6 runtime-wiring slice (branch `feat/cloud-user-token-management-runtime-wiring`). The resolver's rejection LOGIC was reviewed and confirmed correct and was NOT changed. This pass adds CI-executable coverage for that logic, corrects one comment/design-drift note, and repairs a pre-existing broken Postgres-gated test. Task checkboxes in `tasks.md` were not changed.
+
+### FIX 1 — CI-executable coverage of the security-critical wiring seam
+
+Before this pass, revoked/disabled/unknown-token rejection and legacy compatibility through the real `cloudRuntimeAuthenticator` / `cloudstoreManagedTokenLookup` / `cloudPrincipalProjectAuthorizer` adapters were only proven by the Postgres-gated `TestCloudRuntimeWiresManagedTokenAuthEndToEnd` (`cmd/engram/cloud_runtime_e2e_test.go`), which skips without `CLOUDSTORE_TEST_DSN` and therefore never ran in CI. Added non-gated unit tests (no DSN, run in CI) to `cmd/engram/cloud_runtime_auth_test.go`, all using the real `auth.PrincipalResolver` and a real `auth.ManagedTokenHasher` (only the storage seam is faked):
+
+- `TestCloudRuntimeAuthenticatorRejectsRevokedManagedToken` — a managed token whose `ManagedTokenRecord.RevokedAt` is set is rejected with `auth.ErrTokenRevoked`, not resolved to a usable principal.
+- `TestCloudRuntimeAuthenticatorRejectsDisabledPrincipal` — a managed token owned by a disabled principal (`Enabled=false`) is rejected with `auth.ErrPrincipalDisabled`.
+- `TestCloudRuntimeAuthenticatorRejectsPrincipalTokenMismatch` — a lookup that returns a `ManagedTokenRecord.PrincipalID` not matching the resolved `Principal.ID` is rejected with `auth.ErrInvalidPrincipal` (defense-in-depth against a storage-layer join bug).
+- `TestCloudstoreManagedTokenLookupMapsNotFoundToUnknownToken` (pre-existing) plus the full-resolver "totally-unknown-token" assertion in `TestCloudRuntimeAuthenticatorResolvesManagedTokenBeforeLegacyFallback` (pre-existing) already covered the unknown-token path end to end.
+- `TestCloudstoreManagedTokenLookupPropagatesGenericStoreError` — a generic (non-`ErrPrincipalTokenNotFound`) storage error from `FindPrincipalTokenByHash` is propagated as-is, not collapsed into `auth.ErrUnknownToken`.
+- `TestCloudRuntimeAuthenticatorResolvesManagedTokenBeforeLegacyFallback` (pre-existing) already covered: a valid managed token resolves with `Source == PrincipalSourceManagedToken` and the correct `Role`, and legacy `ENGRAM_CLOUD_TOKEN` still authenticates via the fallback path with `Source == PrincipalSourceLegacyEnvSync` (not managed).
+- `TestCloudPrincipalProjectAuthorizerDenyByDefaultAndGrantedProject` (pre-existing) already covered deny-by-default (no grant → denied) and matching-grant → allowed.
+- `TestCloudPrincipalProjectAuthorizerRejectsEmptyOrWhitespaceProject` (new) — empty/whitespace project is rejected with a `"project is required"` error before any store call.
+- `TestCloudPrincipalProjectAuthorizerPropagatesListGrantsError` (new) — a `ListProjectGrants` store error is propagated by both `AuthorizeProjectForPrincipal` and `EnrolledProjectsForPrincipal`, never silently treated as "no grants, but allow anyway."
+
+**Proof these tests have teeth**: for the three new resolver-seam tests (revoked, disabled, mismatch), each corresponding guard in `internal/cloud/auth/foundation.go`'s `ResolveBearerToken` was temporarily short-circuited (e.g. `if false && record.RevokedAt != nil`), the specific new test was re-run and confirmed to FAIL, and the file was restored byte-for-byte (`diff` confirmed clean) before continuing. This confirms each test actually depends on, and would catch a regression in, its corresponding rejection branch — not just re-asserting a tautology.
+
+Kept the Postgres-gated e2e/SQL tests unchanged; they still add real-DB depth on top of this new CI-executable layer.
+
+### FIX 2 — startup-branch coverage without a DB
+
+Extracted `buildRuntimeAuthenticator(cfg cloud.Config, cs *cloudstore.CloudStore, allowedProjects []string, token string, insecureNoAuth bool) (cloudserver.Authenticator, *auth.ManagedTokenHasher, error)` out of `newCloudRuntime` in `cmd/engram/cloud.go`. `newCloudRuntime` now just calls it; behavior is unchanged (verified via the existing Postgres-gated `TestCloudRuntimeWiresManagedTokenAuthEndToEnd`, still passing). The seam works without a live Postgres connection because `auth.NewService` accepts a nil `*cloudstore.CloudStore`, and `cloudstoreManagedTokenLookup{store: cs}` is only invoked later, at request time, not during construction — so `cs` can safely be `nil` in tests.
+
+Added `cmd/engram/cloud_runtime_authenticator_build_test.go` (no DSN, runs in CI):
+
+- `TestBuildRuntimeAuthenticatorInsecureNoAuthReturnsNilAuthenticator` — `insecureNoAuth` branch returns a nil authenticator, nil hasher, nil error.
+- `TestBuildRuntimeAuthenticatorRejectsTooShortPepperWithoutLoggingValue` — a too-short `TokenPepper` returns an error wrapping `auth.ErrTokenPepperTooShort`, and the error text does not contain the raw pepper value (checked with `strings.Contains`).
+- `TestBuildRuntimeAuthenticatorNoPepperDisablesManagedAuthButKeepsLegacy` — no `TokenPepper` configured yields a nil hasher but a non-nil authenticator whose `ResolveBearerToken` still authenticates the legacy sync token and rejects a managed-token-shaped bearer string as unknown (not mis-resolved).
+
+All three run and pass without `CLOUDSTORE_TEST_DSN`, closing the CI gap on these three startup branches, which previously required a live Postgres connection (through `cloudstore.New`) to reach.
+
+### FIX 3 — resolver-order comment/design drift (accuracy only, no behavior change)
+
+`cloud.go`'s resolver-construction comment (now inside `buildRuntimeAuthenticator`, formerly inline in `newCloudRuntime` around the original lines 107-113) claimed "managed token storage first, then legacy env-token credentials." `internal/cloud/auth/foundation.go`'s `PrincipalResolver.ResolveBearerToken` actually checks `resolveLegacy` FIRST, then falls back to managed token storage. The resolver's actual behavior was NOT changed. Corrected the comment on `buildRuntimeAuthenticator` (and added a pointer note in `cmd/engram/cloud_runtime_auth.go`'s `cloudRuntimeAuthenticator` doc comment) to state the true legacy-first order, plus the deliberate-deviation rationale: 32-byte crypto/rand managed secrets cannot practically collide with a single operator-chosen legacy secret, so the order has no observable security effect; checking legacy first is intentional (not an oversight) because it avoids a hash-and-DB-lookup round trip on the legacy-sync hot path for every request that isn't a managed token attempt. This deviation from design.md migration step 3's "managed-first" wording is now recorded both in code comments and here.
+
+### FIX 4 — repaired the pre-existing broken Postgres-gated test
+
+`TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle` (`internal/cloud/cloudstore/identity_storage_test.go`, introduced in commit `9defadf`) created exactly one admin principal and then immediately demoted/disabled that same principal via `UpdatePrincipal`, which `guardLastActiveAdminTx` correctly rejects with `ErrLastActiveAdmin` (there being no other active admin to fall back to). Confirmed the failure reproduces against a real local Postgres instance before the fix:
+
+```
+identity_storage_test.go:99: UpdatePrincipal: cloudstore: cannot remove last active admin
+--- FAIL: TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle
+```
+
+Fixed the fixture (not the guard) by creating a second active admin principal (`cs.CreatePrincipal(..., DisplayName: "Backup Admin", Role: PrincipalRoleAdmin)`) immediately before the `UpdatePrincipal` demotion call, so the guard's "at least one other active admin" invariant is satisfied and the test can legally exercise the demotion it was always meant to test. Re-ran against the same real Postgres instance (a throwaway local `postgresql@14` cluster, `CLOUDSTORE_TEST_DSN` pointed at it) and confirmed:
+
+```
+--- PASS: TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle
+```
+
+Also re-ran the full `internal/cloud/cloudstore` package (all tests, including all other Postgres-gated tests) and `cmd/engram`'s `TestCloudRuntimeWiresManagedTokenAuthEndToEnd` against the same instance — all PASS, confirming this fixture fix does not disturb any other admin-guard-adjacent test (e.g. `TestCloudstoreIdentityGuardsAndErrorPaths`, `TestCloudstoreLastActiveAdminGuardSerializesConcurrentRemoval`, `TestCreateFirstAdminHumanUserSerializesConcurrentBootstrap`).
+
+### Files changed (this remediation pass)
+
+| File | Action | What Was Done |
+|------|--------|----------------|
+| `cmd/engram/cloud.go` | Modified | Extracted `buildRuntimeAuthenticator` from `newCloudRuntime` (FIX2 seam); no behavior change. |
+| `cmd/engram/cloud_runtime_auth.go` | Modified | Added a doc-comment note correcting the resolver-order claim and pointing to the deviation rationale (FIX3). |
+| `cmd/engram/cloud_runtime_auth_test.go` | Modified | Added FIX1 coverage: revoked/disabled/mismatch/generic-store-error/empty-project/list-grants-error tests, plus a shared test helper and a `forceErr` field on both existing fakes. |
+| `cmd/engram/cloud_runtime_authenticator_build_test.go` | Created | FIX2 coverage: `buildRuntimeAuthenticator`'s three startup branches, no DSN required. |
+| `internal/cloud/cloudstore/identity_storage_test.go` | Modified | FIX4: fixed `TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle`'s fixture to create a second admin before demoting the first. |
+
+### Verification (this remediation pass)
+
+- `go build ./...`: clean.
+- `go test ./cmd/engram ./internal/cloud/...` (no DSN): PASS; all new FIX1/FIX2 tests ran (not skipped); Postgres-gated tests skipped cleanly as expected.
+- `go test ./...`: PASS.
+- `go test -race ./cmd/engram ./internal/cloud/...`: PASS.
+- Against a real (throwaway, local) Postgres instance via `CLOUDSTORE_TEST_DSN`: `TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle` now PASSES (previously reproduced as failing, confirmed above); the full `internal/cloud/cloudstore` suite PASSES; `TestCloudRuntimeWiresManagedTokenAuthEndToEnd` PASSES.
+- `gofmt -l` on all touched Go files: empty. `git diff --check` on all touched files: clean.
+- Regression-teeth proof for FIX1's revoked/disabled/mismatch tests: each corresponding guard was temporarily disabled, the specific test failed as expected, then the source file was restored and confirmed byte-identical via `diff` before moving on.
+
+### Not-a-real-bug / no action taken
+
+- The "unknown token hash" and "valid managed token resolves correctly" and "deny-by-default" scenarios from the requested coverage list were already covered by pre-existing tests (`TestCloudstoreManagedTokenLookupMapsNotFoundToUnknownToken`, `TestCloudRuntimeAuthenticatorResolvesManagedTokenBeforeLegacyFallback`, `TestCloudPrincipalProjectAuthorizerDenyByDefaultAndGrantedProject`); no new test was needed for those, only confirmed they still pass.
+- No change was made to `auth.PrincipalResolver.ResolveBearerToken`'s legacy-first check order — confirmed correct and intentionally left as-is (see FIX3).

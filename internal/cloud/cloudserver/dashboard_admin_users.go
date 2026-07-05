@@ -279,22 +279,17 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 	// unknown/stale principalID silently mint and persist a real token
 	// against a principal that does not exist, then render a blank-username
 	// show-once page for it.
-	users, err := store.ListHumanUsers(r.Context())
+	user, found, err := findManagedUserByPrincipalID(r.Context(), store, principalID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("list users: %v", err), http.StatusInternalServerError)
 		return
 	}
-	var user cloudstore.HumanUser
-	found := false
-	for _, u := range users {
-		if u.PrincipalID == principalID {
-			user = u
-			found = true
-			break
-		}
-	}
 	if !found {
 		http.Error(w, "managed user not found", http.StatusNotFound)
+		return
+	}
+	if !user.Enabled {
+		s.renderDashboardManagedTokenDisabled(w, r, user)
 		return
 	}
 	managedToken, err := cloudauth.GenerateManagedToken("live")
@@ -315,6 +310,14 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 		CreatedByPrincipalID: actor.ID,
 	})
 	if err != nil {
+		if errors.Is(err, cloudstore.ErrPrincipalDisabled) {
+			s.renderDashboardManagedTokenDisabled(w, r, user)
+			return
+		}
+		if errors.Is(err, cloudstore.ErrPrincipalNotFound) {
+			http.Error(w, "managed user not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, fmt.Sprintf("create token: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -323,6 +326,14 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 		return
 	}
 	renderDashboardAdminComponent(w, r, s.dashboardAdminLayout(r, "Token Created", dashboard.ManagedUserTokenCreatedPage(user, managedToken.Raw, sanitizeTokenForDisplay(token))))
+}
+
+func (s *CloudServer) renderDashboardManagedTokenDisabled(w http.ResponseWriter, r *http.Request, user cloudstore.HumanUser) {
+	message := "Enable this managed user before creating a managed token."
+	if strings.TrimSpace(user.Username) != "" {
+		message = fmt.Sprintf("%s User %s is currently disabled.", message, user.Username)
+	}
+	renderDashboardAdminComponentStatus(w, r, http.StatusConflict, s.dashboardAdminLayout(r, "Cannot Create Token", dashboard.EmptyState("Cannot Create Token", message)))
 }
 
 // sanitizeTokenForDisplay clears the token hash before handing a

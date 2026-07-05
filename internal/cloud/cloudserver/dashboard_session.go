@@ -187,7 +187,7 @@ func (s *CloudServer) recordDashboardLoginAudit(ctx context.Context, principal c
 		metadata["recovery"] = true
 	}
 	return store.InsertAuthAuditEvent(ctx, cloudstore.AuthAuditEvent{
-		ActorPrincipalID: strings.TrimSpace(principal.ID),
+		ActorPrincipalID: auditActorPrincipalIDRef(principal),
 		ActorSource:      actorSource,
 		Action:           authAuditActionDashboardLogin,
 		Outcome:          strings.TrimSpace(outcome),
@@ -526,7 +526,7 @@ func (s *CloudServer) recordBootstrapAuditBestEffort(ctx context.Context, actor 
 	}
 	actorSource := auditActorSource(actor)
 	if err := s.adminIdentity.InsertAuthAuditEvent(ctx, cloudstore.AuthAuditEvent{
-		ActorPrincipalID:  strings.TrimSpace(actor.ID),
+		ActorPrincipalID:  auditActorPrincipalIDRef(actor),
 		ActorSource:       actorSource,
 		TargetPrincipalID: strings.TrimSpace(targetPrincipalID),
 		Action:            authAuditActionDashboardBootstrap,
@@ -549,7 +549,7 @@ func (s *CloudServer) dashboardBootstrapStore(w http.ResponseWriter) (dashboardP
 
 func (s *CloudServer) recordDashboardBootstrapAudit(ctx context.Context, store dashboardPrincipalStore, actor cloudauth.Principal, outcome, reason, targetPrincipalID string) error {
 	actorSource := auditActorSource(actor)
-	return store.InsertAuthAuditEvent(ctx, cloudstore.AuthAuditEvent{ActorPrincipalID: strings.TrimSpace(actor.ID), ActorSource: actorSource, TargetPrincipalID: strings.TrimSpace(targetPrincipalID), Action: authAuditActionDashboardBootstrap, Outcome: strings.TrimSpace(outcome), ReasonCode: strings.TrimSpace(reason), Metadata: map[string]any{"source": actorSource}})
+	return store.InsertAuthAuditEvent(ctx, cloudstore.AuthAuditEvent{ActorPrincipalID: auditActorPrincipalIDRef(actor), ActorSource: actorSource, TargetPrincipalID: strings.TrimSpace(targetPrincipalID), Action: authAuditActionDashboardBootstrap, Outcome: strings.TrimSpace(outcome), ReasonCode: strings.TrimSpace(reason), Metadata: map[string]any{"source": actorSource}})
 }
 
 // auditActorSource returns the principal's source string, defaulting to
@@ -562,6 +562,31 @@ func auditActorSource(actor cloudauth.Principal) string {
 		return source
 	}
 	return authAuditActorSourceUnauthenticated
+}
+
+// auditActorPrincipalIDRef returns the principal ID to record as an audit
+// event's ActorPrincipalID, or "" when the principal is not an actual row in
+// cloud_principals. cloud_auth_audit_log.actor_principal_id is a nullable
+// BIGINT REFERENCES cloud_principals(id) (see design.md's persistence
+// design and cloudstore's migration), but legacy/bootstrap/unauthenticated
+// principals are represented by synthetic, non-numeric sentinel IDs (e.g.
+// "legacy:admin", "legacy:sync") that are never persisted as
+// cloud_principals rows. Passing one of those sentinels straight through to
+// cloudstore.InsertAuthAuditEvent's ActorPrincipalID makes Postgres reject
+// the insert outright (invalid bigint literal), which — once
+// WithAdminIdentityStore is actually wired into a running server (this
+// runtime-wiring slice) — turned a successful legacy admin dashboard login
+// into a 500 "unable to create dashboard session" (recordDashboardLoginAudit
+// failing closed). Only cloudauth.PrincipalSourceManagedToken principals
+// resolve to a real cloud_principals row, so only that source's ID is safe
+// to reference here; every other source's actor identity is still fully
+// captured in the audit event's ActorSource/Metadata fields, just not as a
+// foreign-key-checked column.
+func auditActorPrincipalIDRef(actor cloudauth.Principal) string {
+	if actor.Source != cloudauth.PrincipalSourceManagedToken {
+		return ""
+	}
+	return strings.TrimSpace(actor.ID)
 }
 
 func dashboardLoginPathWithNextLocal(next string) string {

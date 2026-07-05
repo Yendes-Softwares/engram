@@ -254,6 +254,20 @@ func TestDashboardLegacyAdminLoginAuditsRecoveryAfterManagedAdminExists(t *testi
 	if event.ActorSource != string(cloudauth.PrincipalSourceLegacyEnvAdmin) {
 		t.Fatalf("expected legacy admin actor source, got %+v", event)
 	}
+	// The legacy admin principal's ID ("legacy:admin") is a synthetic
+	// sentinel, not a real cloud_principals row. cloudstore's real
+	// InsertAuthAuditEvent stores ActorPrincipalID as a nullable
+	// BIGINT REFERENCES cloud_principals(id); this fake store does not
+	// enforce that type, so it would silently accept "legacy:admin" even
+	// though the real database rejects it outright. Once
+	// WithAdminIdentityStore is wired into a running server (the runtime
+	// managed-token wiring slice), that real-database rejection turned every
+	// legacy admin dashboard login into a 500 ("unable to create dashboard
+	// session") — recordDashboardLoginAudit fails closed. This assertion
+	// pins the fix (auditActorPrincipalIDRef) at the real call site.
+	if event.ActorPrincipalID != "" {
+		t.Fatalf("expected legacy admin actor principal ID to be empty (not a real cloud_principals row), got %+v", event)
+	}
 	if recovery, ok := event.Metadata["recovery"].(bool); !ok || !recovery {
 		t.Fatalf("expected legacy admin login after managed admin exists to be tagged as recovery, got %+v", event.Metadata)
 	}
@@ -327,6 +341,15 @@ func TestDashboardBootstrapAuditsAcceptedFirstAdminCreation(t *testing.T) {
 	}
 	if event.ActorSource != string(cloudauth.PrincipalSourceLegacyEnvAdmin) {
 		t.Fatalf("expected bootstrap actor source to be legacy admin, got %+v", event)
+	}
+	// See the identical assertion/comment in
+	// TestDashboardLegacyAdminLoginAuditsRecoveryAfterManagedAdminExists:
+	// the legacy admin's synthetic ID must never be sent as
+	// ActorPrincipalID, or the real cloudstore.InsertAuthAuditEvent rejects
+	// the insert (invalid bigint literal) once an admin identity store is
+	// actually wired into a running server.
+	if event.ActorPrincipalID != "" {
+		t.Fatalf("expected legacy admin bootstrap actor principal ID to be empty (not a real cloud_principals row), got %+v", event)
 	}
 	assertNoSensitiveAuditMetadata(t, event)
 }

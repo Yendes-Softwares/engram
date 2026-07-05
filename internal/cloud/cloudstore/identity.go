@@ -27,6 +27,9 @@ var (
 	ErrLastActiveAdmin        = errors.New("cloudstore: cannot remove last active admin")
 	ErrSensitiveAuditMetadata = errors.New("cloudstore: sensitive auth audit metadata is not allowed")
 	ErrAdminAlreadyExists     = errors.New("cloudstore: a managed admin already exists")
+	ErrPrincipalNotFound      = errors.New("cloudstore: principal not found")
+	ErrPrincipalDisabled      = errors.New("cloudstore: principal is disabled")
+	ErrPrincipalTokenNotFound = errors.New("cloudstore: principal token not found")
 )
 
 type Principal struct {
@@ -410,10 +413,36 @@ func (cs *CloudStore) CreatePrincipalToken(ctx context.Context, params CreatePri
 		return PrincipalToken{}, fmt.Errorf("cloudstore: token hash is required")
 	}
 	const q = `
+		WITH target_principal AS (
+			SELECT id
+			FROM cloud_principals
+			WHERE id = $1 AND enabled = TRUE
+			FOR UPDATE
+		)
 		INSERT INTO cloud_principal_tokens (principal_id, token_prefix, token_hash, name, created_by_principal_id)
-		VALUES ($1, $2, $3, $4, $5)
+		SELECT p.id, $2, $3, $4, $5
+		FROM target_principal p
 		RETURNING id::text, principal_id::text, token_prefix, '' AS token_hash, name, COALESCE(created_by_principal_id::text, ''), created_at, last_used_at, revoked_at, COALESCE(revoked_by_principal_id::text, ''), COALESCE(revocation_reason, '')`
-	return scanPrincipalToken(cs.db.QueryRowContext(ctx, q, principalID, tokenPrefix, tokenHash, strings.TrimSpace(params.Name), nullableID(params.CreatedByPrincipalID)))
+	token, err := scanPrincipalToken(cs.db.QueryRowContext(ctx, q, principalID, tokenPrefix, tokenHash, strings.TrimSpace(params.Name), nullableID(params.CreatedByPrincipalID)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return PrincipalToken{}, cs.principalTokenTargetError(ctx, principalID)
+	}
+	return token, err
+}
+
+func (cs *CloudStore) principalTokenTargetError(ctx context.Context, principalID string) error {
+	var enabled bool
+	err := cs.db.QueryRowContext(ctx, `SELECT enabled FROM cloud_principals WHERE id = $1`, strings.TrimSpace(principalID)).Scan(&enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrPrincipalNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("cloudstore: read token principal: %w", err)
+	}
+	if !enabled {
+		return ErrPrincipalDisabled
+	}
+	return fmt.Errorf("cloudstore: token principal is unavailable")
 }
 
 func (cs *CloudStore) ListPrincipalTokens(ctx context.Context, principalID string) ([]PrincipalToken, error) {
@@ -442,6 +471,55 @@ func (cs *CloudStore) ListPrincipalTokens(ctx context.Context, principalID strin
 		return nil, fmt.Errorf("cloudstore: iterate principal tokens: %w", err)
 	}
 	return tokens, nil
+}
+
+// FindPrincipalTokenByHash looks up a managed token record and its owning
+// principal by the token's HMAC verifier hash. It is the storage-only
+// production lookup consumed (through a package-boundary-safe adapter, since
+// internal/cloud/auth already imports cloudstore and a direct cloudstore ->
+// auth import would cycle) by cloudauth.ManagedTokenLookup at runtime, so
+// managed cloud tokens can actually authenticate against a running
+// `engram cloud serve` process rather than only in tests.
+//
+// Returns ErrPrincipalTokenNotFound (not sql.ErrNoRows) when no token matches
+// tokenHash, so callers can map it to the auth package's own "unknown token"
+// sentinel without leaking a database-specific error type. The returned
+// PrincipalToken's TokenHash field is intentionally left blank, matching the
+// same "never return the stored hash to a caller" convention already used by
+// ListPrincipalTokens/CreatePrincipalToken — the caller already holds the
+// hash it looked up with and never needs it echoed back.
+func (cs *CloudStore) FindPrincipalTokenByHash(ctx context.Context, tokenHash string) (PrincipalToken, Principal, error) {
+	if cs == nil || cs.db == nil {
+		return PrincipalToken{}, Principal{}, fmt.Errorf("cloudstore: not initialized")
+	}
+	tokenHash = strings.TrimSpace(tokenHash)
+	if tokenHash == "" {
+		return PrincipalToken{}, Principal{}, fmt.Errorf("cloudstore: token hash is required")
+	}
+	const q = `
+		SELECT t.id::text, t.principal_id::text, t.token_prefix, '' AS token_hash, t.name,
+		       COALESCE(t.created_by_principal_id::text, ''), t.created_at, t.last_used_at, t.revoked_at,
+		       COALESCE(t.revoked_by_principal_id::text, ''), COALESCE(t.revocation_reason, ''),
+		       p.id::text, p.kind, p.display_name, p.role, p.enabled, p.created_at, p.updated_at
+		FROM cloud_principal_tokens t
+		JOIN cloud_principals p ON p.id = t.principal_id
+		WHERE t.token_hash = $1`
+	var token PrincipalToken
+	var principal Principal
+	err := cs.db.QueryRowContext(ctx, q, tokenHash).Scan(
+		&token.ID, &token.PrincipalID, &token.TokenPrefix, &token.TokenHash, &token.Name,
+		&token.CreatedByPrincipalID, &token.CreatedAt, &token.LastUsedAt, &token.RevokedAt,
+		&token.RevokedByPrincipalID, &token.RevocationReason,
+		&principal.ID, &principal.Kind, &principal.DisplayName, &principal.Role, &principal.Enabled,
+		&principal.CreatedAt, &principal.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PrincipalToken{}, Principal{}, ErrPrincipalTokenNotFound
+	}
+	if err != nil {
+		return PrincipalToken{}, Principal{}, fmt.Errorf("cloudstore: find principal token by hash: %w", err)
+	}
+	return token, principal, nil
 }
 
 func (cs *CloudStore) RevokePrincipalToken(ctx context.Context, tokenID, revokedByPrincipalID, reason string) error {
@@ -685,6 +763,19 @@ func nullableJSON(metadata map[string]any) (any, error) {
 		return nil, fmt.Errorf("cloudstore: encode auth audit metadata: %w", err)
 	}
 	return encoded, nil
+}
+
+// NormalizeProjectGrant exposes normalizeCloudProjectGrant's normalization
+// rules to callers outside this package (specifically, the cmd/engram
+// PrincipalProjectAuthorizer adapter wired into cloudserver at runtime) so a
+// caller-presented project name can be compared against stored
+// cloud_project_grants rows using the exact same normalization that
+// CreateProjectGrant already applies when persisting a grant. Duplicating
+// this normalization logic in another package instead of reusing it here
+// would risk the two falling out of sync and silently breaking grant
+// enforcement.
+func NormalizeProjectGrant(project string) string {
+	return normalizeCloudProjectGrant(project)
 }
 
 func normalizeCloudProjectGrant(project string) string {

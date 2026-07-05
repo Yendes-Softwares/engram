@@ -95,6 +95,14 @@ func TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle(t *testing.T) {
 	if gotPrincipal.ID != principal.ID || gotPrincipal.Kind != PrincipalKindHuman || gotPrincipal.Role != PrincipalRoleAdmin || !gotPrincipal.Enabled {
 		t.Fatalf("stored principal mismatch: %+v", gotPrincipal)
 	}
+
+	// The last-active-admin guard (guardLastActiveAdminTx) correctly refuses
+	// to demote/disable the only active admin, so a second active admin must
+	// exist before this test can legally exercise UpdatePrincipal's
+	// role/enabled mutation on `principal` below.
+	if _, err := cs.CreatePrincipal(ctx, CreatePrincipalParams{Kind: PrincipalKindHuman, DisplayName: "Backup Admin", Role: PrincipalRoleAdmin}); err != nil {
+		t.Fatalf("CreatePrincipal backup admin: %v", err)
+	}
 	if err := cs.UpdatePrincipal(ctx, principal.ID, UpdatePrincipalParams{Role: PrincipalRoleMember, Enabled: false}); err != nil {
 		t.Fatalf("UpdatePrincipal: %v", err)
 	}
@@ -129,6 +137,9 @@ func TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle(t *testing.T) {
 	}
 	if users[0].Enabled {
 		t.Fatalf("disabled human user should list as disabled: %+v", users[0])
+	}
+	if err := cs.SetHumanUserEnabled(ctx, human.PrincipalID, true); err != nil {
+		t.Fatalf("SetHumanUserEnabled(true): %v", err)
 	}
 
 	token, err := cs.CreatePrincipalToken(ctx, CreatePrincipalTokenParams{PrincipalID: human.PrincipalID, TokenPrefix: "egc_live_ab12cd34", TokenHash: "hmac-sha256:v1:hash-only", Name: "laptop", CreatedByPrincipalID: principal.ID})
@@ -194,6 +205,97 @@ func TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Action != "grant.revoke" || events[0].Metadata["token_prefix"] != "egc_live_ab12cd34" {
 		t.Fatalf("auth audit event mismatch: %+v", events)
+	}
+}
+
+func TestCreatePrincipalTokenRejectsDisabledPrincipalWithoutPersisting(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+
+	user, err := cs.CreateHumanUser(ctx, CreateHumanUserParams{Username: "disabled-token-target", Email: "disabled-token-target@example.test", DisplayName: "Disabled Target", Role: PrincipalRoleMember})
+	if err != nil {
+		t.Fatalf("CreateHumanUser: %v", err)
+	}
+	if err := cs.SetHumanUserEnabled(ctx, user.PrincipalID, false); err != nil {
+		t.Fatalf("SetHumanUserEnabled(false): %v", err)
+	}
+
+	_, err = cs.CreatePrincipalToken(ctx, CreatePrincipalTokenParams{PrincipalID: user.PrincipalID, TokenPrefix: "egc_live_disabled", TokenHash: "hmac-sha256:v1:disabled-hash", Name: "blocked"})
+	if !errors.Is(err, ErrPrincipalDisabled) {
+		t.Fatalf("expected ErrPrincipalDisabled for disabled principal token create, got %v", err)
+	}
+	tokens, err := cs.ListPrincipalTokens(ctx, user.PrincipalID)
+	if err != nil {
+		t.Fatalf("ListPrincipalTokens after disabled create attempt: %v", err)
+	}
+	if len(tokens) != 0 {
+		t.Fatalf("disabled principal token create must not persist metadata, got %+v", tokens)
+	}
+}
+
+// TestFindPrincipalTokenByHashResolvesActiveTokenAndRejectsUnknownOrRevoked
+// is the RED-first proof for the runtime managed-token wiring slice: before
+// FindPrincipalTokenByHash existed, this test failed to compile (undefined
+// method). It now proves the storage-only lookup that
+// cloudauth.ManagedTokenLookup depends on at runtime: an active token's hash
+// resolves to both the token metadata and its owning principal, an unknown
+// hash returns ErrPrincipalTokenNotFound (not a raw sql.ErrNoRows), and a
+// revoked token still resolves (RevokedAt non-nil) so the caller — not this
+// storage method — makes the revoked/enabled decision, matching how
+// cloudauth.PrincipalResolver.ResolveBearerToken already expects to receive
+// the record and decide.
+func TestFindPrincipalTokenByHashResolvesActiveTokenAndRejectsUnknownOrRevoked(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+
+	human, err := cs.CreateHumanUser(ctx, CreateHumanUserParams{Username: "runtime-bob", Email: "runtime-bob@example.test", DisplayName: "Runtime Bob", Role: PrincipalRoleMember})
+	if err != nil {
+		t.Fatalf("CreateHumanUser: %v", err)
+	}
+	const tokenHash = "hmac-sha256:v1:runtime-wiring-hash"
+	created, err := cs.CreatePrincipalToken(ctx, CreatePrincipalTokenParams{PrincipalID: human.PrincipalID, TokenPrefix: "egc_live_rt001122", TokenHash: tokenHash, Name: "ci-runner"})
+	if err != nil {
+		t.Fatalf("CreatePrincipalToken: %v", err)
+	}
+
+	gotToken, gotPrincipal, err := cs.FindPrincipalTokenByHash(ctx, tokenHash)
+	if err != nil {
+		t.Fatalf("FindPrincipalTokenByHash active token: %v", err)
+	}
+	if gotToken.ID != created.ID || gotToken.PrincipalID != human.PrincipalID || gotToken.TokenHash != "" || gotToken.RevokedAt != nil {
+		t.Fatalf("unexpected token record: %+v", gotToken)
+	}
+	if gotPrincipal.ID != human.PrincipalID || gotPrincipal.Kind != PrincipalKindHuman || gotPrincipal.Role != PrincipalRoleMember || !gotPrincipal.Enabled {
+		t.Fatalf("unexpected principal record: %+v", gotPrincipal)
+	}
+
+	if _, _, err := cs.FindPrincipalTokenByHash(ctx, "hmac-sha256:v1:never-issued"); !errors.Is(err, ErrPrincipalTokenNotFound) {
+		t.Fatalf("expected ErrPrincipalTokenNotFound for unknown hash, got %v", err)
+	}
+
+	if err := cs.RevokePrincipalToken(ctx, created.ID, human.PrincipalID, "rotated"); err != nil {
+		t.Fatalf("RevokePrincipalToken: %v", err)
+	}
+	revokedToken, _, err := cs.FindPrincipalTokenByHash(ctx, tokenHash)
+	if err != nil {
+		t.Fatalf("FindPrincipalTokenByHash revoked token: %v", err)
+	}
+	if revokedToken.RevokedAt == nil {
+		t.Fatal("expected revoked token lookup to still resolve with a non-nil RevokedAt so the caller can reject it")
+	}
+}
+
+// TestNormalizeProjectGrantMatchesInternalNormalization is a pure (non-DSN)
+// RED-first test proving the exported NormalizeProjectGrant helper — added
+// so the cmd/engram runtime PrincipalProjectAuthorizer adapter can normalize
+// a request project exactly like CreateProjectGrant does before storing —
+// stays byte-for-byte identical to the package's own internal normalization.
+func TestNormalizeProjectGrantMatchesInternalNormalization(t *testing.T) {
+	cases := []string{"Alpha Project", "alpha-project", "  Weird!!Chars__here  ", ""}
+	for _, input := range cases {
+		if got, want := NormalizeProjectGrant(input), normalizeCloudProjectGrant(input); got != want {
+			t.Fatalf("NormalizeProjectGrant(%q) = %q, want %q (must match normalizeCloudProjectGrant)", input, got, want)
+		}
 	}
 }
 
